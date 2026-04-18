@@ -13,21 +13,35 @@
 #include <AUI/Util/UIBuildingHelpers.h>
 
 ACustomCaptionWindow::ACustomCaptionWindow(const AString& name, int width, int height, bool stacked)
-  : ACustomWindow(name, width, height), CustomCaptionWindowImplWin32() {
+  : ACustomWindow(name, width, height), CustomCaptionWindowImplCurrent() {
     initCustomCaption(name, stacked, this);
-    connect(mMiddleButton->clickedButton, this, [&]() {
-        if (isMaximized()) {
-            restore();
-        } else {
-            maximize();
-        }
-    });
 
+    // Caption state → maximize/restore icon swap. Always wired; becomes a no-op on platforms
+    // where updateMiddleButtonIcon() has nothing to update (macOS).
     connect(minimized, this, [&]() { updateMiddleButtonIcon(); });
     connect(restored, this, [&]() { updateMiddleButtonIcon(); });
     connect(maximized, this, [&]() { updateMiddleButtonIcon(); });
-    connect(mCloseButton->clickedButton, this, &AWindow::quit);
-    connect(mMinimizeButton->clickedButton, this, &AWindow::minimize);
+
+    // Button signal wiring only when the impl actually creates app-drawn buttons.
+    // macOS uses AppKit-native traffic lights, so mMinimizeButton/mMiddleButton/mCloseButton
+    // are null and the window actions are handled by the OS.
+    if (mMiddleButton) {
+        connect(mMiddleButton->clickedButton, this, [&]() {
+            if (isMaximized()) {
+                restore();
+            } else {
+                maximize();
+            }
+        });
+    }
+
+    if (mCloseButton) {
+        connect(mCloseButton->clickedButton, this, &AWindow::quit);
+    }
+
+    if (mMinimizeButton) {
+        connect(mMinimizeButton->clickedButton, this, &AWindow::minimize);
+    }
 }
 
 bool ACustomCaptionWindow::isCustomCaptionMaximized() { return isMaximized(); }
