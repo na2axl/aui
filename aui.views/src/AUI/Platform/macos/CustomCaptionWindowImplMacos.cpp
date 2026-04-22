@@ -24,8 +24,13 @@ void CustomCaptionWindowImplMacos::initCustomCaption(const AString& name, bool s
     caption->setExpanding({ 1, 0 });
     caption->setFixedSize({ 0, 28_dp });
 
-    // Reserve space for AppKit-drawn traffic lights on the left (Apple HIG default cluster is ~70pt).
-    caption->addView(_new<ASpacerFixed>(80_dp));
+    const bool minMaxHidden = [&] {
+        if (auto* window = dynamic_cast<AWindow*>(to)) {
+            return !!(window->windowStyle() & WindowStyle::NO_MINIMIZE_MAXIMIZE);
+        }
+        return false;
+    }();
+    caption->addView(_new<ASpacerFixed>(minMaxHidden ? 24_dp : 80_dp));
 
     auto titleLabel = _new<ALabel>(name) << ".title";
     caption->addView(titleLabel);
