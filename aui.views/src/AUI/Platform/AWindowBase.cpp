@@ -41,6 +41,16 @@ AWindowBase::AWindowBase() {
 }
 
 AWindowBase::~AWindowBase() {
+    // Close any overlapping surfaces (context menus, dropdowns, tooltips) that were attached to this window.
+    AVector<AOverlappingSurface*> toClose;
+    toClose.reserve(mOverlappingSurfaces.size());
+    for (auto& surface : mOverlappingSurfaces) {
+        toClose << surface.get();
+    }
+    for (auto* surface : toClose) {
+        closeOverlappingSurface(surface);
+    }
+
     if (currentWindowStorage() == this) {
         currentWindowStorage() = nullptr;
     }

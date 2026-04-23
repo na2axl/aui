@@ -63,7 +63,7 @@ void ACustomWindow::onPointerPressed(const APointerPressedEvent& event) {
             emit dragBegin(event.position);
         }
     }
-    AViewContainer::onPointerPressed(event);
+    AWindow::onPointerPressed(event);
 }
 
 
