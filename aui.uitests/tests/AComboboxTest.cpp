@@ -18,6 +18,7 @@
 #include <AUI/View/AComboboxRow.h>
 #include <AUI/Model/AListModel.h>
 #include <AUI/View/ACombobox.h>
+#include <AUI/View/ADropdownList.h>
 
 #include <chrono>
 #include <thread>
@@ -399,6 +400,48 @@ TEST_F(AComboboxTest, SelectionSignalsAndPropertyRoundTrip) {
     EXPECT_EQ(mCombo->getSelected().value(), AString { "alpha" });
 }
 
+// The two halves of examples/7guis/flight_booker's only selectionId() binding, which is the only
+// two-way binder over this widget in the tree. Examples are not configured in this build tree (and
+// that one's ctre.hpp is absent), so nothing compiled it and nothing tested it -- and each half on
+// its own looks right: a one-way connect in either direction only shows up broken once the other
+// half is exercised. Both directions are asserted here so that gap stays shut.
+//
+// The model side is an AProperty<bool> in the manner of UIDataBindingTest: AUI_REACT subscribes to
+// property access, so a plain local would never announce and the model -> widget half would pass for
+// the wrong reason.
+namespace {
+    struct FlightBookerState {
+        AProperty<bool> isReturnFlight { false };
+    };
+} // namespace
+
+TEST_F(AComboboxTest, SelectionIdBindsBothWays) {
+    auto state = aui::ptr::manage_shared(new FlightBookerState);
+    auto combo = _new<ADropdownList>(AListModel<AString>::make({ "one-way flight", "return flight" }));
+
+    AObject::connect(AUI_REACT(state->isReturnFlight ? 1 : 0), combo->selectionId());
+    AObject::connect(combo->selectionId().changed, &gSink,
+                     [&](int id) { state->isReturnFlight = id == 1; });
+
+    // widget -> model: the user picks the second row.
+    combo->selectionId() = 1;
+    EXPECT_TRUE(state->isReturnFlight);
+    ASSERT_EQ(combo->getSelected().value(), AString { "return flight" });
+
+    // model -> widget: the model goes back, and the button has to follow.
+    state->isReturnFlight = false;
+    EXPECT_FALSE(combo->isPopupOpen());
+    EXPECT_EQ(combo->getSelectedId(), 0);
+    ASSERT_TRUE(combo->getSelected().hasValue());
+    EXPECT_EQ(combo->getSelected().value(), AString { "one-way flight" });
+
+    // ...without the model and the widget talking each other in circles: pushing row 1 through the
+    // property also goes back out to the model, which is a write of the value it already holds.
+    combo->selectionId() = 1;
+    EXPECT_TRUE(state->isReturnFlight);
+    EXPECT_EQ(combo->getSelectedId(), 1);
+}
+
 TEST_F(AComboboxTest, FilterSignalAndPropertyRoundTrip) {
     AString notified;
     int notifications = 0;
@@ -418,4 +461,119 @@ TEST_F(AComboboxTest, GenericItemTypeRoundTripsByValue) {
     mPersonCombo->setSelectionId(1);
     ASSERT_TRUE(mPersonCombo->getSelected().hasValue());
     EXPECT_EQ(mPersonCombo->getSelected().value().id, 2);
+}
+
+// ADropdownListCompat describes behaviour ADropdownList already has, so it is green against the old
+// implementation and must stay green once ADropdownList is an alias onto ACombobox<AString>. These
+// are the calls every existing user of the old class makes; if one of them stops compiling or stops
+// behaving, the alias dropped something.
+//
+// testing::UITest rather than a bare TEST: SetUp() (UITestCase.cpp:99) is what calls uitest::setup()
+// (UITestCase.cpp:104), and that is what installs the AStubWindowManager a window needs before show().
+// ButtonStillRendersTheSelectedLabel builds one, so without the fixture there is no window manager at
+// all.
+//
+// show() is called on the constructed window rather than from inside W's constructor: AWindow::show()
+// asks for shared_from_this() (AWindowsImpl.cpp:518, unguarded -- the try/catch two lines above it at
+// 513-516 only covers mSelfHolder), and doing that before the object is fully constructed throws
+// bad_weak_ptr. Every other uitest in the repo calls show() afterwards.
+class ADropdownListCompat : public testing::UITest {};
+
+TEST_F(ADropdownListCompat, IndexApiBehavesAsBefore) {
+    auto combo = _new<ADropdownList>(AListModel<AString>::make({ "alpha", "beta", "gamma" }));
+    EXPECT_EQ(combo->getSelectionId(), 0);
+    combo->setSelectionId(2);
+    EXPECT_EQ(combo->getSelectedId(), 2);
+    EXPECT_EQ(combo->getModel()->listSize(), 3u);
+}
+
+TEST_F(ADropdownListCompat, SelectionIdSignalStillFires) {
+    auto combo = _new<ADropdownList>(AListModel<AString>::make({ "a", "b" }));
+    gNotifications = 0;
+    AObject::connect(combo->selectionChanged, &gSink, [&](int) { ++gNotifications; });
+
+    combo->setSelectionId(1);
+    EXPECT_EQ(gNotifications, 1);
+}
+
+TEST_F(ADropdownListCompat, ButtonStillRendersTheSelectedLabel) {
+    class W : public AWindow {
+    public:
+        _<ADropdownList> combo;
+
+        W() : AWindow("compat", 400_dp, 300_dp) {
+            setContents(Vertical {
+                combo = _new<ADropdownList>(AListModel<AString>::make({ "alpha", "beta" })),
+            });
+            combo->setSelectionId(1);
+        }
+    };
+
+    auto window = _new<W>();
+    window->show();
+    uitest::frame();
+
+    EXPECT_EQ(By::text("beta").toVector().size(), 1u);
+
+    window->removeAllViews();
+    AThread::processMessages();
+}
+
+// The button's label is a view of the model, not a copy of the value at the moment it was selected.
+// The old ADropdownList held an index and answered all three model signals with updateText(), so the
+// repaint re-read whatever now sat at that index. A value cannot be painted without being resolved
+// first, and a mutation can take the selected item out of the model without setModel ever running --
+// editing the selected row in place does exactly that.
+//
+// Answering the model signals with rebuildRows() alone is not enough: it touches mRowsContainer and
+// nothing else, so the button keeps naming an item the model no longer holds, while getSelectionId()
+// has already given up on finding it. That is the state this test exists to keep out.
+TEST_F(ADropdownListCompat, ButtonLabelFollowsTheModel) {
+    class W : public AWindow {
+    public:
+        _<AListModel<AString>> model;
+        _<ADropdownList> combo;
+
+        W() : AWindow("label", 400_dp, 300_dp) {
+            model = AListModel<AString>::make({ "alpha", "beta" });
+            setContents(Vertical {
+                combo = _new<ADropdownList>(model),
+            });
+        }
+    };
+
+    auto window = _new<W>();
+    window->show();
+    uitest::frame();
+
+    ASSERT_EQ(window->combo->getSelectedId(), 0);
+    ASSERT_EQ(By::text("alpha").toVector().size(), 1u) << "the button does not start out showing its selection";
+
+    // Editing the selected row in place. setItem writes the vector; invalidate is what announces the
+    // dataChanged the combobox subscribes to -- which is why the mutation is two statements and not one.
+    window->model->setItem(AListModelIndex(0), AString { "zulu" });
+    window->model->invalidate(0);
+
+    EXPECT_EQ(By::text("alpha").toVector().size(), 0u)
+        << "the button still names the item the model dropped";
+    EXPECT_FALSE(window->combo->getSelected().hasValue())
+        << "the widget reports a selected item that is not in the model";
+    EXPECT_EQ(window->combo->getSelectedId(), -1);
+
+    // Removing the selected row reaches the same place, and must not leave the same stale label.
+    // The selection is not resurrected by putting "alpha" back -- a widget that re-selected itself
+    // the moment the value returned would be a second bug, in the other direction -- so it is
+    // selected again deliberately before the row is taken away underneath it.
+    window->model->setItem(AListModelIndex(0), AString { "alpha" });
+    window->model->invalidate(0);
+    window->combo->setSelectionId(0);
+    ASSERT_EQ(By::text("alpha").toVector().size(), 1u);
+
+    window->model->removeItem(AListModelIndex(0));
+    EXPECT_EQ(By::text("alpha").toVector().size(), 0u) << "removing the selected row left its label behind";
+    EXPECT_FALSE(window->combo->getSelected().hasValue());
+    EXPECT_EQ(window->combo->getSelectedId(), -1);
+
+    window->removeAllViews();
+    AThread::processMessages();
 }
