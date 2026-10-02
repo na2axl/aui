@@ -131,3 +131,41 @@ TEST(Models, FilterInvalidate) {
     AVector<int> expected = { 2, 6, 72, 14, 66, 28 };
     ASSERT_EQ(filteredModel->toVector(), expected);
 }
+
+TEST(Models, IndexOfFindsByValue) {
+    auto model = AListModel<AString>::make({ "alpha", "beta", "gamma" });
+
+    EXPECT_EQ(AModels::indexOf(model, AString { "beta" }), std::size_t(1));
+    EXPECT_EQ(AModels::indexOf(model, AString { "gamma" }), std::size_t(2));
+    EXPECT_FALSE(AModels::indexOf(model, AString { "delta" }).has_value());
+}
+
+TEST(Models, IndexOfOnEmptyModel) {
+    auto model = AListModel<AString>::make({});
+    EXPECT_FALSE(AModels::indexOf(model, AString { "beta" }).has_value());
+}
+
+TEST(Models, IndexOfFirstDuplicateWins) {
+    auto model = AListModel<AString>::make({ "dup", "other", "dup" });
+    EXPECT_EQ(AModels::indexOf(model, AString { "dup" }), std::size_t(0));
+}
+
+TEST(Models, IndexOfOptionalValue) {
+    auto model = AListModel<AString>::make({ "alpha" });
+
+    EXPECT_EQ(AModels::indexOf(model, AOptional<AString> { AString { "alpha" } }), std::size_t(0));
+    EXPECT_FALSE(AModels::indexOf(model, AOptional<AString> {}).has_value());
+}
+
+/**
+ * indexOf takes whatever list model it is handed; a filter is a list model like any other.
+ */
+TEST(Models, IndexOfThroughFilteredModel) {
+    auto model = AListModel<AString>::make({ "alpha", "beta", "gamma" });
+    auto filtered = AModels::filter(model, [](const AString& s) {
+        return s != "beta";
+    });
+
+    EXPECT_EQ(AModels::indexOf(filtered, AString { "gamma" }), std::size_t(1));
+    EXPECT_FALSE(AModels::indexOf(filtered, AString { "beta" }).has_value());
+}
