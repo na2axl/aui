@@ -78,14 +78,10 @@ public:
             mModel = nullptr;
             mFiltered = nullptr;
             mModelSink = nullptr;
-            // setSelected rebuilds only when the selection actually moved, but the rows have to go
-            // either way: they are still sitting there for a model that no longer exists. So the
-            // rebuild is forced exactly in the case setSelected short-circuits on.
-            const bool hadSelection = mSelected.hasValue();
-            setSelected(AOptional<T> {});
-            if (!hadSelection) {
-                rebuildRows();
-            }
+            // The rows have to go either way -- they are still sitting there for a model that no
+            // longer exists -- which is what applySelection owes on the half of its work that
+            // setSelected, short-circuiting on an unchanged selection, does not do.
+            applySelection(AOptional<T> {});
             return;
         }
 
@@ -111,13 +107,15 @@ public:
         // the selection straight back on whatever now sits at the dropped item's index, which is
         // the very failure this widget exists to remove.
         const bool hadSelection = mSelected.hasValue();
-        if (hadSelection && !AModels::indexOf(mModel, mSelected.value()).has_value()) {
-            mSelected = AOptional<T> {};
-        } else if (!hadSelection && mModel->listSize() > 0) {
-            mSelected = mModel->listItemAt(AListModelIndex(0));
+        AOptional<T> selection = mSelected;
+        if (hadSelection) {
+            if (!AModels::indexOf(mModel, mSelected.value()).has_value()) {
+                selection = AOptional<T> {};
+            }
+        } else if (mModel->listSize() > 0) {
+            selection = mModel->listItemAt(AListModelIndex(0));
         }
-        updateText();
-        rebuildRows();
+        applySelection(selection);
     }
 
     [[nodiscard]] const _<IListModel<T>>& getModel() const noexcept { return mModel; }
@@ -194,6 +192,9 @@ public:
             rebuildRows();
         }
         emit selectedChanged(value);
+        // What makes this announcement safe to act on is not this class: a property destination
+        // drops the echo back into the widget while this very signal is mid-emission. See
+        // applySelection before changing who is connected to it.
         emit selectionChanged(getSelectionId());
     }
 
@@ -330,6 +331,43 @@ private:
         }
         updateText();
         rebuildRows();
+    }
+
+    /**
+     * @brief Applies the selection setModel has settled on, announcing it the way any other change
+     *        is announced.
+     * @details setModel and onModelMutated apply one policy -- an item the model no longer holds
+     *          leaves nothing selected -- and used to implement it two ways: setModel assigned
+     *          mSelected directly and said nothing, while onModelMutated went through setSelected and
+     *          announced. A two-way binding therefore heard about a selection lost to a mutation and
+     *          was left pointing at a value that no longer existed when the same selection was lost
+     *          to a replacement.
+     *          setSelected already repaints, and rebuilds the rows while a popup is open; doing that
+     *          here as well would run both a second time on every setModel call, so on the one path
+     *          where setSelected has nothing to announce they are run here instead. That is the only
+     *          case that reaches them: an announced change has already had them, unconditionally for
+     *          the repaint and for the rebuild exactly when there is a popup for setSelected to see.
+     *          The announcement happens with the value already stored, so a handler that writes back
+     *          into the model -- or calls setModel again -- re-enters a widget that has settled, and
+     *          its own setSelected short-circuits instead of starting a cycle.
+     *          The announcement says *nothing is selected*, and the only reason a binding hears that
+     *          instead of "row 0" is the property binding's own loop guard: a property destination
+     *          declines the echo while its own `changed` is mid-emission
+     *          (aui.core/src/AUI/Common/detail/property.h:32), which during this announcement
+     *          selectionChanged is. A lambda slot has no such guard, so binding this widget with
+     *          `AObject::connect(expr, [&](int id) { combo->setSelectionId(id); })` hears -1, drives
+     *          the expression to 0, and re-selects row 0 right here -- undoing, one frame later, the
+     *          drift this widget exists to remove. The shape of the binding is therefore part of this
+     *          contract: bind to the property, `combo->selectionId()`, not to the signal with a lambda.
+     *          Not something to fix here; the guard is a framework rule.
+     */
+    void applySelection(const AOptional<T>& value) {
+        if (mSelected == value) {
+            updateText();
+            rebuildRows();
+            return;
+        }
+        setSelected(value);
     }
 
     _<IListModel<T>> mModel;
@@ -476,6 +514,23 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
     if (!parentWindow) {
         return;
     }
+    auto comboBoxPos = getPositionInWindow();
+
+    // The ceiling the popup may not pass, measured against the room its placement actually has.
+    // createOverlappingSurface takes the first placement the factory offers that lands at
+    // non-negative coordinates (ASurface.h:277) and "below" is offered first, so downwards is the
+    // side the popup opens towards for every combobox that is not itself above the window's origin;
+    // the room above is the bound for the one that is. Measuring the wrong side is the trap: against
+    // the room above, a combobox at the top of a window -- the ordinary case -- would be capped at the
+    // couple of pixels above it. Either way the bound is a slice of the parent's own height, and it is
+    // a bound on the scroll area rather than on the popup itself: the popup is `content` plus the
+    // surface's own chrome, and popupHeight adds the 2px bias underneath, so a popup pinned to the
+    // cap can still hang that much below the parent's bottom edge. Capping cannot push the rows off
+    // the screen either: below, the position does not depend on the height at all, and above, a
+    // shorter popup starts lower, i.e. nearer 0.
+    const int openBelow = comboBoxPos.y + getHeight();
+    const int room = openBelow >= 0 ? parentWindow->getHeight() - openBelow : comboBoxPos.y + 1;
+    const int popupMaxHeight = (glm::min)((glm::max)(room, 0), parentWindow->getHeight());
 
     rebuildRows();
     // AScrollArea has only a default constructor; content goes in via setContents.
@@ -490,6 +545,13 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
         ass::Expanding { 1, 0 },
         // ... so the width still has to be stated outright; the height needs no statement.
         ass::MinSize { AMetric(getWidth(), AMetric::T_PX), {} },
+        // ... up to a point. The ceiling belongs here and not only on the surface passed to
+        // createOverlappingSurface: the popup is packed to its own minimum height, which is the
+        // content's, which is the rows' -- so a ceiling handed over as a size alone is undone by the
+        // next layout pass. MaxSize is AScrollArea's documented way of becoming a scroll area without
+        // expanding, and it is also what makes the viewport smaller than the content; with the two
+        // the same size no scrollbar can appear however long the list is.
+        ass::MaxSize { {}, AMetric(popupMaxHeight, AMetric::T_PX) },
     };
     scrollArea << ".combobox_list";
 
@@ -499,8 +561,11 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
 
     // Height must cover the whole popup content, so anything added above the list later (the filter
     // field) has to go in before this is computed -- it lands in `content` and is counted here.
+    // Nothing is held back for it: the ceiling is the room there is, and whatever goes above the list
+    // spends it. Whoever adds a filter field decides whether it deserves a guaranteed share.
+    // The list's own ceiling is already folded into the minimum height read here, so this is the
+    // capped height when the rows do not fit and the content's own height when they do.
     const int popupHeight = content->getMinimumHeight() + 2; // bias
-    auto comboBoxPos = getPositionInWindow();
     unsigned usedPositionIndex = 0;
 
     auto comboWindow = parentWindow->createOverlappingSurface(

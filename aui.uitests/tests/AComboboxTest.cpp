@@ -19,6 +19,7 @@
 #include <AUI/Model/AListModel.h>
 #include <AUI/View/ACombobox.h>
 #include <AUI/View/ADropdownList.h>
+#include <AUI/View/AScrollArea.h>
 
 #include <chrono>
 #include <thread>
@@ -120,6 +121,13 @@ protected:
     void SetUp() override {
         UITest::SetUp();
         mWindow = _new<TestWindow>();
+        // AStubWindowManager::drawFrame packs every window to its minimum before every frame, so the
+        // 400x300 this window is constructed with arrives at the tests as a 76x38 strip. Nothing
+        // that only reads the selection minds, and everything that lays the popup out does: the
+        // popup is capped to the room the button leaves inside its parent, and a parent with no room
+        // would cap the popup to nothing. Pinning the window to the size it was constructed with is
+        // what a real window manager would hand it anyway.
+        mWindow->setFixedSize({ 400, 300 });
         // AViewContainer has no variadic constructor -- Vertical is what every uitest uses.
         mWindow->setContents(Vertical {
             mCombo = _new<ACombobox<AString>>(
@@ -181,11 +189,56 @@ protected:
         //
         // Comparing the list against the window instead would prove nothing: the list is the
         // popup's whole content, so its bottom always equals the window's bottom.
+        //
+        // It is also, since the cap landed, window-height dependent where it used not to be. The
+        // popup is capped to the room its button leaves inside the parent, so this holds because the
+        // fixture's 300px window leaves far more than its three rows (~64px) need -- before the cap
+        // the popup's height bore no relation to the parent's at all. Shrink the window far enough
+        // and this fails because the popup is capped, which is a different fact from the expanding
+        // and inset arithmetic the assertion was written to guard.
         auto rows = By::name(".list-item").toVector();
         ASSERT_FALSE(rows.empty()) << "the popup lists no rows to fit";
         ASSERT_LE(rows.back()->getPositionInWindow().y + rows.back()->getSize().y,
                   list->getPositionInWindow().y + list->getSize().y)
             << "the popup is too short for its own rows; the last one is clipped";
+    }
+
+    // Waits out the same reveal for a list that is not expected to fit its own last row, and returns
+    // the height it settled at. waitForPopupReveal() cannot serve that case on either count: it waits
+    // for the list to reach its *minimum* height, which is the height of every row -- the very height
+    // a capped popup refuses to reach -- and it then insists the last row is inside the list, which is
+    // precisely what scrolling the overflow away means. So it waits for the height to stop moving
+    // instead: the settled height is not knowable here, being the rows for a short list and the cap
+    // for a long one.
+    int waitForPopupToSettle() {
+        auto list = By::name(".combobox_list").one();
+        if (list == nullptr) {
+            ADD_FAILURE() << "there is no open popup to wait for";
+            return 0;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        int previous = -1;
+        int stable = 0;
+        while (stable < 3) {
+            // The `> 0` matters: the animator may not have produced its first frame yet, and three
+            // frames at zero is not a settled list, it is a list that has not started.
+            const int height = list->getHeight();
+            if (height > 0 && height == previous) {
+                ++stable;
+            } else {
+                previous = height;
+                stable = 0;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ADD_FAILURE() << "the popup's list never finished its reveal animation";
+                break;
+            }
+            uitest::frame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        uitest::frame();
+        return previous;
     }
 
     void TearDown() override {
@@ -440,6 +493,130 @@ TEST_F(AComboboxTest, SelectionIdBindsBothWays) {
     combo->selectionId() = 1;
     EXPECT_TRUE(state->isReturnFlight);
     EXPECT_EQ(combo->getSelectedId(), 1);
+}
+
+// Both ways this widget applies one policy -- the selected item is not in the model any more, so
+// nothing is selected -- have to say so. onModelMutated routed through setSelected and announced;
+// setModel wrote mSelected directly and announced nothing, so a binding that lost its selection to a
+// mutation was told, and one that lost the same selection to a replacement was left holding a value
+// the widget no longer had.
+//
+// The binding is SelectionIdBindsBothWays' own, verbatim, because being told is only half of what a
+// binding is for: the model side has to learn the change too, or it goes on asserting a row the
+// widget has dropped.
+TEST_F(AComboboxTest, SelectionDroppedByModelReplacementIsAnnounced) {
+    auto state = aui::ptr::manage_shared(new FlightBookerState);
+    auto model = AListModel<AString>::make({ "one-way flight", "return flight" });
+    auto combo = _new<ADropdownList>(model);
+
+    AObject::connect(AUI_REACT(state->isReturnFlight ? 1 : 0), combo->selectionId());
+    AObject::connect(combo->selectionId().changed, &gSink,
+                     [&](int id) { state->isReturnFlight = id == 1; });
+
+    combo->selectionId() = 1;
+    ASSERT_TRUE(state->isReturnFlight) << "the binding is not carrying the selection either way";
+    ASSERT_EQ(combo->getSelected().value(), AString { "return flight" });
+
+    int announcements = 0;
+    AObject::connect(combo->selectionChanged, &gSink, [&](int) { ++announcements; });
+
+    // Dropped by a mutation: the item is taken out from under the widget.
+    announcements = 0;
+    model->removeItem(AListModelIndex(1));
+    EXPECT_FALSE(state->isReturnFlight) << "the mutation dropped the selection without telling the binding";
+    EXPECT_EQ(announcements, 1) << "the drop";
+
+    // Dropped by a replacement: the model is swapped for one that no longer holds the item.
+    model->push_back("return flight");
+    combo->setSelectionId(1);
+    ASSERT_TRUE(state->isReturnFlight) << "the binding did not hear the selection being taken again";
+    ASSERT_EQ(combo->getSelected().value(), AString { "return flight" });
+
+    announcements = 0;
+    combo->setModel(AListModel<AString>::make({ "one-way flight", "another flight" }));
+    EXPECT_FALSE(state->isReturnFlight) << "the replacement dropped the selection without telling the binding";
+    EXPECT_EQ(announcements, 1) << "the drop";
+
+    // Exactly one each, and nothing about the value is left hanging: the widget does not drift onto
+    // whatever now sits where the dropped item used to be.
+    EXPECT_FALSE(combo->getSelected().hasValue());
+    EXPECT_EQ(combo->getSelectedId(), -1);
+
+    // What is deliberately not asserted is the write-back the announcement provokes, and the reason
+    // is the property binding's own loop guard rather than anything APropertyPrecomputed does.
+    // AObject::connect(expression, property) (AObject.h:121) resolves its destination through
+    // property.assignment() into aui::detail::property::makeAssignment, whose invocable returns
+    // early while the destination property's own `changed` is mid-emission
+    // (aui.core/src/AUI/Common/detail/property.h:32) -- the guard against a bidirectional connection
+    // feeding itself. selectionId()'s `changed` is the combobox's selectionChanged member
+    // (ACombobox.h:198), which is exactly the signal being emitted as the drop announces, so the row
+    // the binding would push back goes nowhere until the binding next writes. Not the precomputed:
+    // APropertyPrecomputed::invalidate tests *its own* signal, a different object that is not
+    // mid-emission here -- it emits, and the value dies at the guard one level downstream. That is
+    // equally true of both halves -- it is what the mutation path has always done -- and it is a
+    // framework rule rather than this widget's.
+    //
+    // Which makes the *shape* of the binding load-bearing, not incidental. Everything above rests on
+    // this guard and on nothing else: written as a lambda instead --
+    //   AObject::connect(AUI_REACT(state->isReturnFlight ? 1 : 0), [&](int id) { combo->setSelectionId(id); });
+    // -- the slot has no guard, so the drop announces -1, the handler clears isReturnFlight, the
+    // expression emits 0, setSelectionId(0) runs, and the combobox re-selects row 0 on the spot. The
+    // announcement would then contradict itself and undo the very drift this widget exists to prevent
+    // -- and this commit widened the exposure from one path (mutation) to two (mutation and
+    // replacement). A binding that has to survive a drop therefore has to be the property form.
+    //
+    // What this last step does show is the cost of *not* announcing. The binding still believes it
+    // is looking at a return flight, so writing true is writing the value it already holds, nothing
+    // moves, and a widget that dropped its selection silently leaves the binding stuck on a row that
+    // is not there with no way out but for it to be told.
+    state->isReturnFlight = true;
+    ASSERT_EQ(combo->getSelectedId(), 1);
+    EXPECT_EQ(combo->getSelected().value(), AString { "another flight" });
+    EXPECT_TRUE(state->isReturnFlight);
+}
+
+// 60 rows is a little over a thousand pixels of list inside a 300 px window. That is the case the
+// scroll area was chosen for and never got: the popup used to be exactly as tall as its rows, so the
+// viewport was exactly the content, no scrollbar could appear, and every row past the bottom of the
+// screen was simply gone.
+TEST_F(AComboboxTest, LongListIsCappedAndStillScrolls) {
+    auto model = _new<AListModel<AString>>();
+    for (int i = 0; i < 60; ++i) {
+        model->push_back("row-"_format(i));
+    }
+    mCombo->setModel(model);
+
+    clickCombo();
+    uitest::frame();
+
+    auto listView = By::name(".combobox_list").one();
+    ASSERT_NE(listView, nullptr) << "there is no open popup";
+    auto list = _cast<AScrollArea>(listView);
+    ASSERT_NE(list, nullptr) << "the popup's list is no longer a scroll area";
+    ASSERT_GT(waitForPopupToSettle(), 0);
+
+    // Capped, not unbounded. The bound is the room the button leaves inside its own window, so a
+    // popup taller than the window it belongs to is by definition not capped.
+    EXPECT_LT(list->getHeight(), mWindow->getHeight())
+        << "the popup grew past the window it belongs to instead of being capped";
+
+    // ...and capped means scrolling: the scroll area has a viewport smaller than its content, which
+    // is the first time that has ever been true here.
+    ASSERT_GT(list->verticalScrollbar()->getMaxScroll(), 0u)
+        << "the list is capped but reports nothing to scroll: the rows below the cap are unreachable";
+
+    auto rows = By::name(".list-item").toVector();
+    ASSERT_EQ(rows.size(), 60u) << "the rows are not all built, capped or not";
+
+    // The content is still reachable: scrolled to its end, the last row is inside the list again.
+    list->setScrollY(list->verticalScrollbar()->getMaxScroll());
+    uitest::frame();
+    EXPECT_LE(rows.back()->getPositionInWindow().y + rows.back()->getSize().y,
+              list->getPositionInWindow().y + list->getSize().y)
+        << "the last row cannot be scrolled into view";
+
+    mCombo->destroyWindow();
+    uitest::frame();
 }
 
 TEST_F(AComboboxTest, FilterSignalAndPropertyRoundTrip) {
