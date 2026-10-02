@@ -358,6 +358,16 @@ AStylesheet::AStylesheet() {
             Expanding{},
             ATextAlign::LEFT,
         },
+        {
+            // The popup's list container. AUI used to inherit this from the AListView rule; ACombobox's
+            // container is an AScrollArea, which has no rule, so the framework now supplies it. An
+            // application can still override by re-declaring this class.
+            c(".combobox_list"),
+            BackgroundSolid { 0xffffff_rgb },
+            Border { 1_dp, 0x828790_rgb },
+            Padding { 2_dp },
+            AOverflow::HIDDEN,
+        },
 
         // AListView
         {
