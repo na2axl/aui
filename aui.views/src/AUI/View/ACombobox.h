@@ -101,9 +101,9 @@ public:
         });
 
         mModelSink = _new<AObject>();
-        AObject::connect(mModel->dataChanged, mModelSink, [this](const AListModelRange<T>&) { rebuildRows(); });
-        AObject::connect(mModel->dataInserted, mModelSink, [this](const AListModelRange<T>&) { rebuildRows(); });
-        AObject::connect(mModel->dataRemoved, mModelSink, [this](const AListModelRange<T>&) { rebuildRows(); });
+        AObject::connect(mModel->dataChanged, mModelSink, [this](const AListModelRange<T>&) { onModelMutated(); });
+        AObject::connect(mModel->dataInserted, mModelSink, [this](const AListModelRange<T>&) { onModelMutated(); });
+        AObject::connect(mModel->dataRemoved, mModelSink, [this](const AListModelRange<T>&) { onModelMutated(); });
 
         // Preserve by value: look the selection up in the new model rather than carrying its index.
         // `hadSelection` is what separates "nothing was selected yet" (pick a sensible default) from
@@ -201,7 +201,12 @@ public:
         return APropertyDef { this, &ACombobox::getSelectionId, &ACombobox::setSelectionId, selectionChanged };
     }
     /**
-     * @brief Index of the selected item among the currently visible rows, or -1.
+     * @brief Index of the selected item among the currently visible rows, or -1 for no selected row.
+     * @details -1 means there is no selected row, which covers three cases that are worth telling
+     *          apart: nothing is selected at all; there is no model, or the model is empty and so
+     *          has no row 0 to default to; and the selected item is real but is not among the rows
+     *          being shown, because the current filter hides it. In the last case getSelected() still
+     *          answers with the value -- the selection is not lost, only out of sight.
      */
     [[nodiscard]] int getSelectionId() const noexcept {
         if (!mSelected.hasValue()) {
@@ -216,6 +221,20 @@ public:
         }
         return -1;
     }
+    /**
+     * @brief Selects the row at the given index.
+     * @param id The row to select. -1 is the real clearing value, as it is for the property's
+     *           current value: it empties the selection and announces it on selectedChanged and
+     *           selectionChanged.
+     * @details An index past the last visible row is ignored -- nothing is stored and nothing is
+     *          announced. This is deliberate, and it is a difference from the old ADropdownList,
+     *          whose mSelectionId assignment went through with any value and emitted regardless: the
+     *          old class could be told to select row 7 of a 2-row model and would report row 7 back
+     *          out of getSelectionId(). Resolving the index here means the number that comes out is
+     *          always a number that means something.
+     *          A caller that used to clear the selection with setSelectionId(listSize()) no longer
+     *          gets an announcement to propagate; -1 says the same thing and does.
+     */
     void setSelectionId(int id) {
         if (id < 0) {
             setSelected(AOptional<T> {});
@@ -225,6 +244,13 @@ public:
             setSelected(value);
         }
     }
+
+    /**
+     * @brief Index of the selected item among the currently visible rows.
+     * @details The other spelling of [getSelectionId], which documents what the number means; this
+     *          is the same value under the name ADropdownList's callers know.
+     */
+    [[nodiscard]] int getSelectedId() const noexcept { return getSelectionId(); }
 
     [[nodiscard]] bool isPopupOpen() const noexcept { return !mComboWindow.expired(); }
     void destroyWindow();
@@ -283,6 +309,28 @@ private:
      * @details Distinct from [Filter], which is the app-facing predicate taking both.
      */
     using RowFilter = std::function<bool(const T&)>;
+
+    /**
+     * @brief Brings the widget back in step with a model that just announced a change.
+     * @details ADropdownList answered all three signals with updateText() alone, which was enough
+     *          while the selection was an index: repainting the button re-read whatever now sat at
+     *          that index. A value cannot be painted before it has been resolved, because a mutation
+     *          can take the selected item out of the model without setModel ever running -- editing
+     *          the selected row in place is exactly that, and it arrives as dataChanged. So the
+     *          selection is re-resolved first, under the same rule setModel applies (an item the
+     *          model no longer holds leaves nothing selected), and only then is the button repainted.
+     *          Skipping the repaint is what leaves the button naming an item the model has dropped
+     *          while getSelectionId() can no longer find it.
+     * @note Deliberately not folded into rebuildRows: that rebuilds the popup's rows out of the
+     *       model, and the button's label is not one of them.
+     */
+    void onModelMutated() {
+        if (mModel && mSelected.hasValue() && !AModels::indexOf(mModel, mSelected.value()).has_value()) {
+            setSelected(AOptional<T> {});
+        }
+        updateText();
+        rebuildRows();
+    }
 
     _<IListModel<T>> mModel;
     _<AListModelFilter<T, RowFilter>> mFiltered;
