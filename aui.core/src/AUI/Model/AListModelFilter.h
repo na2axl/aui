@@ -14,12 +14,21 @@
 #include <AUI/Model/IListModel.h>
 #include <AUI/Model/IMutableListModel.h>
 #include <AUI/Common/AVector.h>
+#include <functional>
 
 template<typename T, typename Filter>
 class AListModelFilter: public IListModel<T> {
 private:
+    /**
+     * @brief Type-erased predicate.
+     * @details
+     * Every lambda-expression has its own closure type, so the predicate cannot be stored as `Filter` if it is to be
+     * replaceable afterwards. See [setFilter].
+     */
+    using filter_t = std::function<bool(const T&)>;
+
     _<IListModel<T>> mOther;
-    Filter mFilter;
+    filter_t mFilter;
     AVector<size_t> mMapping;
 
     void fill() {
@@ -37,15 +46,9 @@ public:
             mFilter(std::forward<Filter>(adapter)) {
         fill();
 
-        AObject::connect(other->dataChanged, this, [&](const AListModelRange<T>& r){
-            AUI_ASSERTX(0, "unimplemented");
-        });
-        AObject::connect(other->dataInserted, this, [&](const AListModelRange<T>& r){
-            AUI_ASSERTX(0, "unimplemented");
-        });
-        AObject::connect(other->dataRemoved, this, [&](const AListModelRange<T>& r){
-            AUI_ASSERTX(0, "unimplemented");
-        });
+        AObject::connect(other->dataChanged, this, [&](const AListModelRange<T>&){ invalidate(); });
+        AObject::connect(other->dataInserted, this, [&](const AListModelRange<T>&){ invalidate(); });
+        AObject::connect(other->dataRemoved, this, [&](const AListModelRange<T>&){ invalidate(); });
     }
 
 
@@ -77,6 +80,15 @@ public:
             emit this->dataChanged(this->range(0, currentSize));
             emit this->dataRemoved(this->range(currentSize, prevSize));
         }
+    }
+
+    /**
+     * @brief Replaces the predicate and re-applies it.
+     * @param filter new predicate; the filter runs immediately, so this may notify observers.
+     */
+    void setFilter(filter_t filter) {
+        mFilter = std::move(filter);
+        invalidate();
     }
 
     /**
