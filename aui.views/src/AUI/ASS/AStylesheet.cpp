@@ -352,9 +352,19 @@ AStylesheet::AStylesheet() {
         },
         /// [ARadioButton]
 
-        // ADropdownList
+        // ACombobox's button, i.e. every ADropdownList and every ACombobox<Foo>
         {
-            t<ADropdownList>() >> t<ALabel>(),
+            // Keyed on the class, not on t<ADropdownList>(): the alias resolves to ACombobox<AString>,
+            // so a type selector here matches that one instantiation and nothing else, and every
+            // other T -- the reason the class is templated -- matched no rule at all. Its label was
+            // then neither expanding nor left-aligned, and since updateText paints it into a
+            // declarative::Centered, it came out centred while the dropdown it replaced did not.
+            // Nothing asserted and nothing failed; the widget just looked subtly wrong.
+            //
+            // Every ACombobox carries .combobox, so this survives the next ACombobox<Foo>.
+            // Re-declaring t<ADropdownList>() >> t<ALabel>() in an application still works: that
+            // selector is a dynamic_cast, so it still matches ACombobox<AString> as it always did.
+            c(".combobox") >> t<ALabel>(),
             Expanding{},
             ATextAlign::LEFT,
         },
@@ -367,6 +377,83 @@ AStylesheet::AStylesheet() {
             Border { 1_dp, 0x828790_rgb },
             Padding { 2_dp },
             AOverflow::HIDDEN,
+        },
+        {
+            // The popup as a whole, which is to say the frame around the filter field and the list
+            // together. Neither half can carry it: they are siblings, so a frame on either stops at
+            // its own edge, and with a filter field that is exactly what the popup used to be -- two
+            // separately bordered halves meeting at a seam. The seam was two 1 dp rules rather than
+            // one, .input-field's grey and .combobox_list's, laid adjacent by AVerticalLayout's zero
+            // spacing, with the field's 4 dp corners sitting on top of the list's square ones.
+            //
+            // No rule in this stylesheet frames a popup the way this one does, so the reasoning
+            // stands on its own: the frame goes on the view that contains both halves, because on
+            // either half it stops at that half's edge. A context menu looks like the precedent and
+            // is not -- .menu and .menu-background are two classes on the single view
+            // AEmbedMenuProvider::MenuContainer creates, and the frame is on the inner .menu, which
+            // is the opposite arrangement.
+            c(".combobox_popup"),
+            BackgroundSolid { 0xffffff_rgb },
+            Border { 1_dp, 0x828790_rgb },
+            Padding { 2_dp },
+        },
+        {
+            // ... so the list gives up its own frame while it is inside one. Its rows keep the same
+            // 2 px inset either way -- a 2 dp padding under a 1 dp border is the same distance as a
+            // 2 dp padding under the popup's -- so nothing moves. What does change is that the
+            // popup itself is now 4 px wider. The padding moving from the list up to the container
+            // is why that cost became visible, not what the cost is: AView::getMinimumWidth is
+            // clamp(contentMinimum + padding, MinSize, MaxSize), so the list's 2 dp sat inside the
+            // MinSize { getWidth() } ACombobox puts on it and was free, while the container's 2 dp
+            // sits outside every clamp and makes content->getMinimumWidth() 4 px larger. The border
+            // is free either way -- getMinimumWidth never counts it. Putting the 4 back is one term
+            // in the max() ACombobox takes over its popup's width: subtract this rule's horizontal
+            // padding from content->getMinimumWidth() there. Not the six lines of ACombobox's sizing
+            // machinery it reads as, and not worth a change to how the popup computes its own size.
+            //
+            // Overflow is left alone: this rule says nothing about it, and an AScrollArea without
+            // .combobox_list's HIDDEN stops clipping its rows.
+            //
+            // A popup with no filter field is not .combobox_popup, so this does not match there and
+            // the plain popup is exactly what it was.
+            c(".combobox_popup") >> c(".combobox_list"),
+            Border { nullptr },
+            Padding { 0 },
+        },
+        {
+            // The filter field is the popup's header, not a panel of its own: no frame, no radius of
+            // its own, and the popup's own grey as a divider under it so it reads as sitting inside
+            // the frame rather than stacked on the list.
+            //
+            // The 4 dp horizontal padding is what keeps the query on the rows' left edge: both halves
+            // now start 2 px in, .list-item adds 4 px to that and this adds 4 px to the field's own
+            // edge, which is where the two were already aligned before either of them moved. The
+            // 2/4 vertical pair is the popup's 2 dp and .list-item's 4 dp, and comes to the same
+            // 22 px the field measured under .input-field's 3/6 -- so the ceiling ACombobox reads
+            // off the field is unchanged, and the popup is neither taller than it was nor shorter.
+            //
+            // One asymmetry, currently unreachable and left that way: rules apply in insertion
+            // order, so this BorderBottom lands after .input-field's disabled rule and would undo
+            // its Border -- a disabled field would keep the grey fill and grey text and lose the
+            // disabled border. Nothing reaches it (ACombobox never disables the field and no handle
+            // escapes the popup), so it is recorded rather than ruled around; if that ever changes,
+            // hover and focus above show what the missing rule looks like.
+            c(".combobox_filter"),
+            Margin { 0 },
+            BorderRadius { 0 },
+            Padding { 2_dp, 4_dp, 4_dp },
+            BorderBottom { 1_dp, 0x828790_rgb },
+        },
+        {
+            // The divider is the field's only border now, so the hover and focus cues .input-field
+            // paints on a whole frame move onto it. Without them this would be the one text input in
+            // AUI that says nothing about whether it holds the keyboard.
+            class_of::hover(".combobox_filter"),
+            BorderBottom { 1_dp, 0x404040_rgb },
+        },
+        {
+            class_of::focus(".combobox_filter"),
+            BorderBottom { 1_dp, getOsThemeColor() },
         },
 
         // AListView

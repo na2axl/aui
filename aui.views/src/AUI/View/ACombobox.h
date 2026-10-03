@@ -47,6 +47,8 @@
  * against a size_t list size.
  *
  * T must either be AString, or be given a ViewFactory via setViewFactory() before the model is set.
+ *
+ * <!-- aui:index_alias ADropdownList -->
  */
 template <typename T>
 class ACombobox : public AButton {
@@ -57,6 +59,11 @@ public:
     explicit ACombobox(const _<IListModel<T>>& model) : ACombobox() { setModel(model); }
 
     ACombobox() {
+        // The class the default stylesheet keys the button's own label off. Keying that rule on
+        // t<ADropdownList>() instead would have made it match ACombobox<AString> and nothing else,
+        // so every other T -- the whole reason this class is templated -- rendered its label
+        // centred instead of left-aligned, with nothing to say so. See AStylesheet.cpp.
+        addAssName(".combobox");
         if constexpr (std::is_same_v<T, AString>) {
             mViewFactory = [](const T& value) -> _<AView> { return _new<ALabel>(value); };
         }
@@ -158,7 +165,7 @@ public:
      * @brief Shows, or hides, a text field at the top of the popup that filters the rows as it is
      *        typed into.
      * @details Opt-in, so a combo box nobody filters looks exactly as it did. The field is worth
-     *          nothing without a predicate: [setFilterPredicate] has no default because an
+     *          nothing without a predicate: setFilterPredicate has no default because an
      *          arbitrary T cannot be turned into searchable text, so the field on its own types a
      *          query that hides nothing.
      *          Turning the field off also clears the query, so the widget is never left hiding rows
@@ -279,7 +286,7 @@ public:
 
     /**
      * @brief Index of the selected item among the currently visible rows.
-     * @details The other spelling of [getSelectionId], which documents what the number means; this
+     * @details The other spelling of getSelectionId, which documents what the number means; this
      *          is the same value under the name ADropdownList's callers know.
      */
     [[nodiscard]] int getSelectedId() const noexcept { return getSelectionId(); }
@@ -296,6 +303,18 @@ public:
 signals:
     emits<AOptional<T>> selectedChanged;
     emits<AString> filterChanged;
+    /**
+     * @brief The selected row's index among the visible rows, announced whenever it changes, -1 for
+     *        no selected row.
+     * @details Bind to the property, `combo->selectionId()`, not to this signal with a lambda.
+     *          -1 is also what a selection dropped by a model mutation or a model replacement
+     *          announces, and a lambda slot has nothing to stop it acting on that: the handler
+     *          clears its model, the expression emits 0, and the widget re-selects row 0 -- undoing,
+     *          one frame later, the drift a value-resolved selection exists to remove. A property
+     *          destination has the loop guard that drops that echo (the destination's own `changed`
+     *          is mid-emission, aui.core/src/AUI/Common/detail/property.h:32), so the -1 sticks.
+     *          Nothing to fix here; the guard is a framework rule.
+     */
     emits<int> selectionChanged;
 
 protected:
@@ -361,7 +380,15 @@ private:
             setSelected(AOptional<T> {});
         }
         updateText();
-        rebuildRows();
+        // Only while there is a popup, for the reason setSelected gives: a closed combo box is
+        // rebuilt on its way to opening anyway, so rebuilding here would construct an AComboboxRow
+        // and a content view for every item of a popup nobody can see -- and the rows it did build
+        // would be thrown away and rebuilt on the next click. On a 5k-item dropdown that is 5k view
+        // allocations per model mutation, for nothing. ADropdownList was not wasteful here because
+        // it answered the model signals with updateText() alone.
+        if (mComboWindow.lock()) {
+            rebuildRows();
+        }
     }
 
     /**
@@ -381,16 +408,8 @@ private:
      *          The announcement happens with the value already stored, so a handler that writes back
      *          into the model -- or calls setModel again -- re-enters a widget that has settled, and
      *          its own setSelected short-circuits instead of starting a cycle.
-     *          The announcement says *nothing is selected*, and the only reason a binding hears that
-     *          instead of "row 0" is the property binding's own loop guard: a property destination
-     *          declines the echo while its own `changed` is mid-emission
-     *          (aui.core/src/AUI/Common/detail/property.h:32), which during this announcement
-     *          selectionChanged is. A lambda slot has no such guard, so binding this widget with
-     *          `AObject::connect(expr, [&](int id) { combo->setSelectionId(id); })` hears -1, drives
-     *          the expression to 0, and re-selects row 0 right here -- undoing, one frame later, the
-     *          drift this widget exists to remove. The shape of the binding is therefore part of this
-     *          contract: bind to the property, `combo->selectionId()`, not to the signal with a lambda.
-     *          Not something to fix here; the guard is a framework rule.
+     *          What makes the -1 announcement safe for a binding to act on is the property binding's
+     *          own loop guard; the shape that needs it is on selectionChanged, which is public.
      */
     void applySelection(const AOptional<T>& value) {
         if (mSelected == value) {
@@ -424,6 +443,12 @@ private:
      *          the widget writes itself can tell the two apart. Reconciled against mComboWindow on
      *          every pointer move, since a click that lands anywhere else also kills the popup without
      *          running a line of this class.
+     * @note This latch and isPopupOpen() deliberately disagree during the stale window -- after a
+     *       foreign kill, before the next pointer move. The latch is pessimistically "I owe the user
+     *       a toggle-close", which is what onPointerReleased has to read; isPopupOpen() reports
+     *       observable truth. `isPopupOpen() { return mPopupIsOpen; }` is the obvious tidy-up and it
+     *       breaks the toggle: the next press after a click-away would close a popup that has been
+     *       gone for a while instead of opening one.
      */
     bool mPopupIsOpen = false;
 
@@ -597,18 +622,13 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
     int filterHeight = 0;
     if (mFilterEnabled) {
         field = _new<ATextField>();
-        // .input-field, which ATextField already carries, is most of what keeps the popup from
-        // looking assembled from two unrelated parts: the field arrives framed and white like the
-        // list below it, without this class duplicating either colour.
-        //
-        // It is not all of it, and the part it does not cover is worth naming before someone tries
-        // to close it. What separates the two is two stacked 1 dp grey rules, not one: the field's
-        // own border and .combobox_list's (AStylesheet.cpp:200 and :367), and they land adjacent --
-        // the field is content's first child and the list its second, with no spacing between them
-        // (AVerticalLayout's spacing is 0) -- so a two-tone horizontal line is drawn straight across
-        // the popup. The corner shapes are the other half: the field's are 4 dp, the list's are
-        // square. Both are left as they are on purpose; .combobox_filter is the hook for restyling
-        // the field, and nothing selects on it yet.
+        // .input-field, which ATextField already carries, supplies the white fill, the text colour
+        // and the font. .combobox_filter is what fits the field into the frame the popup now draws
+        // around both halves (see where content is named .combobox_popup): it zeroes the radius,
+        // and because every border flavour shares one property slot, its BorderBottom is not an
+        // addition to .input-field's frame but a replacement of it -- the popup's grey as a divider
+        // under the field instead of a second frame above it. Both rules are in AStylesheet.cpp,
+        // with the reasoning that moved the frame up here.
         field << ".combobox_filter";
         // No setText(mFilter): the clear above already ran, and it runs whenever mFilter is
         // non-empty, so by this line the query is empty and the field starts empty with it. The
@@ -694,6 +714,13 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
         ass::MaxSize { {}, AMetric(popupMaxHeight, AMetric::T_PX) },
     };
     if (field) {
+        // `field` is the predicate here and mFilterEnabled is what it tracks: the handle is created
+        // under exactly that test at the top of this function and is never reassigned, so a popup
+        // has one exactly when the filter is on. Naming .combobox_popup there and not here would
+        // restyle every ADropdownList in every application -- it is what makes .combobox_list give
+        // up its own frame in exchange, and a popup with no field has nothing to share it with, so
+        // it keeps the frame it has always had. See AStylesheet.cpp.
+        content << ".combobox_popup";
         content->addView(field);
     }
     content->addView(scrollArea);
