@@ -20,6 +20,12 @@
 #include <AUI/View/ACombobox.h>
 #include <AUI/View/ADropdownList.h>
 #include <AUI/View/AScrollArea.h>
+#include <AUI/View/ATextField.h>
+#include <AUI/ASS/AStylesheet.h>
+#include <AUI/ASS/Selector/ParentSelector.h>
+#include <AUI/ASS/Selector/AAssSelector.h>
+#include <AUI/ASS/Selector/type_of.h>
+#include <AUI/ASS/Rule.h>
 
 #include <chrono>
 #include <thread>
@@ -159,9 +165,6 @@ protected:
     // so a row is not hittable until the reveal is done. uitest::frame() does not advance the clock
     // -- the animator is wall-clock driven -- so a test that clicks straight after opening the popup
     // races it. Poll the list up to its full height with a bounded budget instead.
-    //
-    // TypingInTheFilterNarrowsTheRows, which arrives with the filter field in a later task, clicks
-    // into the popup as well and has to wait the same way.
     void waitForPopupReveal() {
         auto list = By::name(".combobox_list").one();
         ASSERT_NE(list, nullptr) << "there is no open popup to wait for";
@@ -178,24 +181,31 @@ protected:
         uitest::frame();
 
         // The popup's height is content height plus the .combobox_list container's own 4px padding and 2px
-        // border, and that arithmetic only balances because of ass::Expanding { 1, 0 }: expanding
-        // vertically is what stops AScrollArea::getContentMinimumHeight from reporting 0 and
-        // swallowing the inset. It has broken once already, and the next task adds a filter field
-        // above the list, perturbing precisely this arithmetic. So pin what actually breaks -- the
-        // last row fitting inside the list:
+        // border, and that arithmetic only balances because of ass::Expanding { 1, 0}: expanding
+        // vertically is what stops AScrollArea::getContentMinimumHeight from reporting 0 (it answers
+        // 0 outright for a view that expands on that axis, AScrollArea.cpp:67) and swallowing the
+        // inset. It has broken once already. So pin what actually breaks -- the last row fitting
+        // inside the list:
         //
         //   ass::Expanding { 1, 0 } (current): list 64 tall, last row spans 42..62 -> fits
         //   ass::Expanding {}       (previous): list 60 tall, last row spans 42..62 -> clipped 2px
+        //   ass::Expanding { 1, 1 } (tried):  list  4 tall, nothing fits at all
         //
-        // Comparing the list against the window instead would prove nothing: the list is the
-        // popup's whole content, so its bottom always equals the window's bottom.
+        // Comparing the list against the window instead would prove nothing: without a filter field
+        // the list is the popup's whole content, so its bottom always equals the window's bottom.
         //
-        // It is also, since the cap landed, window-height dependent where it used not to be. The
-        // popup is capped to the room its button leaves inside the parent, so this holds because the
-        // fixture's 300px window leaves far more than its three rows (~64px) need -- before the cap
-        // the popup's height bore no relation to the parent's at all. Shrink the window far enough
-        // and this fails because the popup is capped, which is a different fact from the expanding
-        // and inset arithmetic the assertion was written to guard.
+        // It is also, since the cap landed, window-height dependent where it used not to be, and the
+        // filter field added a second term to the same sum. The popup is capped to the room its
+        // button leaves inside the parent minus whatever the field takes of it, so this holds because
+        // the fixture's 300px window leaves far more than its three rows (~64px) plus a filter field
+        // (~22px) need -- before the cap the popup's height bore no relation to the parent's at all.
+        // Shrink the window far enough and this fails because the popup is capped, which is a
+        // different fact from the expanding and inset arithmetic the assertion was written to guard;
+        // the capped case has waitForPopupToSettle below, which is what the long list uses.
+        //
+        // Nothing here is specific to whether the field is on: these numbers are relative to the
+        // list, which the field is a sibling of and not a parent of, so a field shifts the list's
+        // position inside the popup without changing anything measured here.
         auto rows = By::name(".list-item").toVector();
         ASSERT_FALSE(rows.empty()) << "the popup lists no rows to fit";
         ASSERT_LE(rows.back()->getPositionInWindow().y + rows.back()->getSize().y,
@@ -638,6 +648,508 @@ TEST_F(AComboboxTest, GenericItemTypeRoundTripsByValue) {
     mPersonCombo->setSelectionId(1);
     ASSERT_TRUE(mPersonCombo->getSelected().hasValue());
     EXPECT_EQ(mPersonCombo->getSelected().value().id, 2);
+}
+
+// The filter field. Everything below is opt-in: with setFilterEnabled left alone the popup holds the
+// list and nothing else, which is what the tests above already assert.
+//
+// PopupWindowSpy exists for the two that have to look at the popup from the outside. comboWindow() is
+// protected, and the surface it hands back is a view inside the popup's own AWindow rather than the
+// window: what has a position on the screen is the window, which is the surface's parent. Anonymous
+// namespace, like Person above -- this TU is linked alongside every other test file.
+namespace {
+    class PopupWindowSpy : public ACombobox<AString> {
+    public:
+        AWindow* popupWindow() {
+            if (auto surface = comboWindow()) {
+                return dynamic_cast<AWindow*>(surface->getParent());
+            }
+            return nullptr;
+        }
+    };
+
+    // Presses and releases `view` the way ViewActionClick does, but without the uitest::frame()
+    // that would follow it, so a caller can read the popup window between the release and the next
+    // frame.
+    //
+    // The frame has to be left out on purpose, and its absence is the whole reason the popup's
+    // placement used to look unobservable. AStubWindowManager::drawFrame packs every window to its
+    // minimum, and packing an AWindow is not size-only: AView::pack calls setSize, which for a
+    // window resolves to AWindow::setSize, which calls setGeometry(getWindowPosition()...), and
+    // AWindow::getWindowPosition() answers {0, 0} for a window with no native handle
+    // (win32/AWindowsImpl.cpp:464). Under the stub manager a window never gets one, so the first
+    // frame after the popup is shown overwrites the position createOverlappingSurfaceImpl stored.
+    // Before that frame the position is exactly what the factory produced and the popup was shown
+    // at; after it, the value is {0, 0} no matter what the factory returned. The matcher DSL can
+    // only ever read the second.
+    void clickLeavingFrame(const _<AView>& view) {
+        const auto coords = view->getPositionInWindow() + view->getSize() / 2;
+        auto window = view->getWindow();
+        AInput::overrideStateForTesting(AInput::LBUTTON, true);
+        window->onPointerPressed({ coords, APointerIndex::button(AInput::LBUTTON) });
+        uitest::frame();
+        AInput::overrideStateForTesting(AInput::LBUTTON, false);
+        window->onPointerReleased({ coords, APointerIndex::button(AInput::LBUTTON) });
+    }
+
+    // Puts the global stylesheet back on every exit path, a failed ASSERT included. A rule left
+    // installed would leak into every test that follows it in the same binary.
+    class StylesheetGuard {
+    public:
+        StylesheetGuard() : mSaved(AStylesheet::global().getRules()) {}
+        ~StylesheetGuard() { AStylesheet::global().setRules(mSaved); }
+
+    private:
+        AVector<ass::Rule> mSaved;
+    };
+} // namespace
+
+TEST_F(AComboboxTest, FilterFieldAppearsOnlyWhenEnabled) {
+    clickCombo();
+    uitest::frame();
+    EXPECT_EQ(By::type<ATextField>().toVector().size(), 0u);
+    mCombo->destroyWindow();
+    uitest::frame();
+
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+    EXPECT_EQ(By::type<ATextField>().toVector().size(), 1u);
+}
+
+TEST_F(AComboboxTest, WithoutAPredicateTheFilterIsPassThrough) {
+    mCombo->setFilterEnabled(true);
+    mCombo->setFilter("bet");
+    clickCombo();
+    uitest::frame();
+
+    // ACombobox cannot turn an arbitrary T into searchable text, so the default predicate shows
+    // everything. This is the documented default, not a bug.
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 3u);
+}
+
+TEST_F(AComboboxTest, TypingInTheFilterNarrowsTheRows) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+
+    auto field = _cast<ATextField>(By::type<ATextField>().one());
+    ASSERT_NE(field, nullptr);
+    field->setText("bet");
+    uitest::frame();
+
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 1u);
+    EXPECT_EQ(By::text("beta").toVector().size(), 1u);
+    // Scoped to the rows on purpose. By::text() is asked of every view in every window, and this
+    // fixture keeps a second combo box whose button reads "alpha" too -- mPersonCombo selects
+    // Person{ 1, "alpha" } -- so By::text("alpha") is 2 whether or not a row survived the filter.
+    EXPECT_EQ((By::name(".list-item").allChildren() & By::text("alpha")).toVector().size(), 0u);
+}
+
+TEST_F(AComboboxTest, TypingIntoTheFieldItselfNarrowsTheRows) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+
+    // The same narrowing, by the route a user actually takes: keystrokes into the focused field.
+    // A programmatic setText and a keystroke are two different announcements (textChanged against
+    // textChanging) and the field has to answer both -- a filter that only narrows when nobody is
+    // typing would look exactly right in a test and dead in the app.
+    By::name(".combobox_filter").perform(type("bet"));
+    uitest::frame();
+
+    EXPECT_EQ(mCombo->getFilter(), AString { "bet" });
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 1u);
+    EXPECT_EQ(By::text("beta").toVector().size(), 1u);
+}
+
+TEST_F(AComboboxTest, TheFilterFieldIsClickableAndDoesNotCloseThePopup) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+    ASSERT_TRUE(mCombo->isPopupOpen());
+
+    // The popup is its own AWindow with its own (empty) list of close-on-click surfaces, so a press
+    // inside it is handled there and never reaches the parent's close loop. That is load-bearing for
+    // a field: a widget inside a popup that the popup cannot survive a press on is not a field, and
+    // nothing about the type of T or the predicate would tell you -- the popup would simply close the
+    // moment it was touched, and the query could never be typed.
+    By::name(".combobox_filter").perform(click());
+    uitest::frame();
+    EXPECT_TRUE(mCombo->isPopupOpen()) << "clicking the filter field closed the popup";
+    EXPECT_TRUE(By::name(".combobox_filter").one()->hasFocus()) << "the filter field did not take the focus";
+
+    // ...and focus leaving the field is not a different story: AViewContainer::onPointerPressed runs
+    // after the close loop, so the press that steals the focus is the same press that would have
+    // closed it.
+    By::name(".combobox_filter").perform(type("bet"));
+    uitest::frame();
+    EXPECT_TRUE(mCombo->isPopupOpen()) << "typing into the filter field closed the popup";
+
+    // A row is still selectable while the field holds the focus -- the field being focused is not a
+    // reason the rows stopped answering.
+    By::text("beta").perform(click());
+    uitest::frame();
+    ASSERT_TRUE(mCombo->getSelected().hasValue());
+    EXPECT_EQ(mCombo->getSelected().value(), AString { "beta" });
+    EXPECT_FALSE(mCombo->isPopupOpen());
+}
+
+TEST_F(AComboboxTest, FilteringDoesNotChangeTheSelection) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    mCombo->setSelectionId(0); // "alpha"
+    clickCombo();
+    uitest::frame();
+
+    auto field = _cast<ATextField>(By::type<ATextField>().one());
+    ASSERT_NE(field, nullptr);
+    field->setText("bet"); // hides the selected row
+    uitest::frame();
+
+    ASSERT_TRUE(mCombo->getSelected().hasValue());
+    EXPECT_EQ(mCombo->getSelected().value(), AString { "alpha" });
+    EXPECT_EQ(mCombo->getSelectionId(), -1); // not visible, so no row highlighted
+}
+
+// The query the field is holding when the popup closes must not come back with it. The brief this
+// was specified from set the query with setFilter and then asserted it survived the opening click,
+// which is the opposite of the invariant the same brief states -- opening a popup clears the query.
+// So the query is put there the way a user leaves it, by typing, and what is asserted is the reopen.
+//
+// Which is the harder direction anyway: a query written before the popup existed has been cleared by
+// the time anyone could look at the list it was meant to narrow.
+TEST_F(AComboboxTest, FilterIsClearedWhenThePopupReopens) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+
+    By::name(".combobox_filter").perform(type("bet"));
+    uitest::frame();
+    ASSERT_EQ(mCombo->getFilter(), AString { "bet" });
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 1u);
+
+    mCombo->destroyWindow();
+    uitest::frame();
+    clickCombo();
+    uitest::frame();
+
+    EXPECT_EQ(mCombo->getFilter(), AString { "" });
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 3u);
+}
+
+// The counterpart of the clear above, and the invariant that makes it a clear rather than an edit:
+// opening a popup is not an author edit, so it must not be announced as one. Without this, a two-way
+// binding over filter() would write the emptied query back into whatever it is bound to every time
+// the combo box was clicked -- the same loop-guard hazard setSelected documents, one level down.
+TEST_F(AComboboxTest, OpeningThePopupClearsTheFilterWithoutAnnouncingIt) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    mCombo->setFilter("bet");
+
+    int announcements = 0;
+    AObject::connect(mCombo->filterChanged, &gSink, [&](const AString&) { ++announcements; });
+
+    clickCombo();
+    uitest::frame();
+
+    EXPECT_EQ(mCombo->getFilter(), AString { "" }) << "the stale query survived the popup opening";
+    EXPECT_EQ(announcements, 0) << "opening a popup announced a filter change, which is an author edit's news";
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 3u);
+
+    // Clearing the query the user cannot see is still not an edit, and turning the field off is --
+    // that one *is* the author changing the widget, so it has to be announced or a binding over
+    // filter() would keep the query it was told about.
+    mCombo->destroyWindow();
+    uitest::frame();
+    mCombo->setFilter("bet");
+    mCombo->setFilterEnabled(false);
+    EXPECT_EQ(announcements, 2) << "the two author edits were not announced";
+}
+
+TEST_F(AComboboxTest, DisablingTheFilterRestoresEveryRow) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    mCombo->setFilter("bet");
+    mCombo->setFilterEnabled(false);
+    clickCombo();
+    uitest::frame();
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 3u);
+}
+
+TEST_F(AComboboxTest, IsFilterEnabledReportsTheSetting) {
+    EXPECT_FALSE(mCombo->isFilterEnabled()) << "the filter is opt-in";
+    mCombo->setFilterEnabled(true);
+    EXPECT_TRUE(mCombo->isFilterEnabled());
+    mCombo->setFilterEnabled(false);
+    EXPECT_FALSE(mCombo->isFilterEnabled());
+}
+
+// The clear in DisablingTheFilterRestoresEveryRow happens before the popup is built, so it cannot
+// speak for what the field does while a popup is already open. The popup is a window of its own and
+// takes no instruction from the widget, so it survives the switch and keeps a field -- holding the
+// text it had, because nothing told it otherwise. What the field must not do is vote: a keystroke
+// into a filter the author just switched off would put the query straight back.
+TEST_F(AComboboxTest, DisablingTheFilterSilencesAnOpenPopupField) {
+    enableSubstringFilter();
+    mCombo->setFilterEnabled(true);
+    clickCombo();
+    uitest::frame();
+
+    By::name(".combobox_filter").perform(type("bet"));
+    uitest::frame();
+    ASSERT_EQ(mCombo->getFilter(), AString { "bet" });
+    ASSERT_EQ(By::name(".list-item").toVector().size(), 1u);
+
+    mCombo->setFilterEnabled(false);
+    EXPECT_EQ(mCombo->getFilter(), AString { "" }) << "switching the filter off did not clear the query";
+    EXPECT_TRUE(mCombo->isPopupOpen()) << "the open popup did not survive the switch";
+
+    By::name(".combobox_filter").perform(type("a"));
+    uitest::frame();
+
+    EXPECT_EQ(mCombo->getFilter(), AString { "" })
+        << "the open popup's field put a query back into a filter that is off";
+    EXPECT_EQ(By::name(".list-item").toVector().size(), 3u)
+        << "the rows narrowed against a filter that is off";
+}
+
+// 60 rows is a little over a thousand pixels of list. With the field on top of it the popup is taller
+// than the room the combo box leaves inside its window unless the ceiling knows the field is there:
+// the ceiling is read off the list, and the field is added on top of the result, so a cap that does
+// not subtract it puts the bottom of the popup past the bottom edge of the window -- 22px of it, in
+// this fixture -- and the rows below the cap are then unreachable rather than merely capped.
+TEST_F(AComboboxTest, TheFilterFieldIsPaidForOutOfTheCappedRoom) {
+    auto model = _new<AListModel<AString>>();
+    for (int i = 0; i < 60; ++i) {
+        model->push_back("row-"_format(i));
+    }
+
+    auto combo = _new<PopupWindowSpy>();
+    combo->setModel(model);
+    combo->setFilterEnabled(true);
+    auto window = _new<TestWindow>();
+    window->setFixedSize({ 400, 300 });
+    window->setContents(Vertical { combo });
+    window->show();
+    uitest::frame();
+
+    By::type<PopupWindowSpy>().perform(click());
+    uitest::frame();
+
+    auto popupWindow = combo->popupWindow();
+    ASSERT_NE(popupWindow, nullptr) << "the popup is not open";
+    const int top = combo->getPositionInWindow().y + combo->getHeight();
+    // The 2 is the popup's own bias, which LongListIsCappedAndStillScrolls documents and which this
+    // does not try to fix: it is below the cap, not above it.
+    EXPECT_LE(top + popupWindow->getSize().y, window->getHeight() + 2)
+        << "the filter field pushed the popup out of the window it belongs to";
+
+    auto field = By::name(".combobox_filter").one();
+    auto listView = By::name(".combobox_list").one();
+    ASSERT_NE(field, nullptr);
+    ASSERT_NE(listView, nullptr);
+    EXPECT_GT(field->getSize().y, 0) << "the field was squeezed out of a popup too small to hold it";
+    EXPECT_LE(field->getPositionInWindow().y + field->getSize().y, listView->getPositionInWindow().y + 1)
+        << "the field is not above the list it filters";
+
+    auto list = _cast<AScrollArea>(listView);
+    ASSERT_NE(list, nullptr);
+    EXPECT_GT(list->verticalScrollbar()->getMaxScroll(), 0u)
+        << "the list is capped but reports nothing to scroll: taking the field's share left the rows "
+           "no room to be reached in";
+
+    window->removeAllViews();
+    AThread::processMessages();
+}
+
+// The second placement the factory offers is the only one a combo box off the top edge of its window
+// ever gets, and it used to be unreachable by construction: "above" was comboBoxPos.y - popupHeight +
+// 1 against "below"'s comboBoxPos.y + height, a strictly smaller y for every popupHeight >= 2, so
+// whenever the first attempt was rejected for being off the top the second was rejected for the same
+// reason, and createOverlappingSurface gave up with the rejected negative coordinate still stored --
+// a popup created 165px above a window it belongs to, on top of a ceiling that had gone negative
+// because "the room below" for a combo box that is itself off the top is no room at all. A filter
+// field makes both halves worse -- the popup it adds to is taller, so the subtraction that pushes it
+// off the top grows with the field -- which is why this is fixed here rather than left for whoever
+// adds a field next.
+//
+// What is asserted is the ceiling, not the placement coordinate. The popup's position is not
+// observable here: the position is correct when AWindow::show() runs, and reads back as (0, 0) from
+// the next uitest::frame() onwards, so an assertion on it would pass whatever the factory returned.
+// The clamp on attempt 1 is therefore argued from the framework's own reference overload
+// (ASurface.h:253, glm::clamp against the parent's size) rather than asserted, and this test pins the
+// half that *is* observable -- a ceiling measured on the side the popup actually opens towards.
+TEST_F(AComboboxTest, TheCeilingFollowsTheSideThePopupOpensTowards) {
+    // 60 rows, so the popup is capped whichever way it opens and the only thing left that can differ
+    // is which side the ceiling was measured from.
+    auto model = _new<AListModel<AString>>();
+    for (int i = 0; i < 60; ++i) {
+        model->push_back("row-"_format(i));
+    }
+
+    auto combo = _new<PopupWindowSpy>();
+    combo->setModel(model);
+    auto window = _new<TestWindow>();
+    window->setFixedSize({ 400, 300 });
+    combo AUI_OVERRIDE_STYLE {
+        ass::Margin { -40_px },
+    };
+    window->setContents(Vertical { combo });
+    window->show();
+    uitest::frame();
+
+    ASSERT_LT(combo->getPositionInWindow().y + combo->getHeight(), 0)
+        << "the fixture did not put the combo box off the top edge, so this asserts nothing";
+
+    By::type<PopupWindowSpy>().perform(click());
+    uitest::frame();
+    ASSERT_TRUE(combo->isPopupOpen()) << "the popup did not open at all";
+
+    auto popupWindow = combo->popupWindow();
+    ASSERT_NE(popupWindow, nullptr);
+
+    // Opening upwards, the ceiling is the window itself: the position factory clamps the popup into
+    // the window, so the window is the only bound available before the height is known. The room
+    // below is not a substitute -- for a combo box off the top it is zero, and a zero ceiling is a
+    // popup with no rows in it at all.
+    EXPECT_EQ(popupWindow->getSize().y, window->getHeight())
+        << "the popup's ceiling was measured on the side it does not open towards";
+
+    window->removeAllViews();
+    AThread::processMessages();
+}
+
+// The filter field's height is read off a field that has no ancestry yet, and read again through
+// the popup's minimum once it has one. The two readings are not the same number, and the ceiling
+// is arithmetic over both: the list's MaxSize has this reading subtracted from it, so a field that
+// measures larger once it is inside the popup hands the popup room it does not have, and the popup
+// leaves its parent by exactly the difference.
+//
+// Nothing exotic is needed to make the two disagree. A rule that needs a window above the view
+// cannot match a view that has no parent, which is what this field is when its minimum is read;
+// adding it to the popup's content is a view-graph change, and that invalidates the styles, so the
+// same field resolves again with the popup window above it and comes out larger.
+TEST_F(AComboboxTest, AFilterFieldThatGrowsInContextCannotPushThePopupOutOfTheParent) {
+    StylesheetGuard guard;
+    AStylesheet::global().addRule(ass::Rule{ ass::AAssSelector(ass::t<AWindow>() >> ass::t<ATextField>()),
+                                             ass::MinSize { 100_dp, 90_dp } });
+
+    auto model = _new<AListModel<AString>>();
+    for (int i = 0; i < 60; ++i) {
+        model->push_back("row-"_format(i));
+    }
+    auto combo = _new<PopupWindowSpy>();
+    combo->setModel(model);
+    combo->setFilterEnabled(true);
+    auto window = _new<TestWindow>();
+    window->setFixedSize({ 400, 300 });
+    window->setContents(Vertical { combo });
+    window->show();
+    uitest::frame();
+
+    const int top = combo->getPositionInWindow().y + combo->getHeight();
+    By::type<PopupWindowSpy>().perform(click());
+    uitest::frame();
+
+    auto popupWindow = combo->popupWindow();
+    ASSERT_NE(popupWindow, nullptr) << "the popup is not open";
+    // The two readings do not diverge when the popup is created -- the height above is computed
+    // before the field is given a parent -- but on the next layout pass, so waiting for the reveal
+    // to settle is what gives the difference time to become visible.
+    waitForPopupToSettle();
+
+    auto field = By::name(".combobox_filter").one();
+    ASSERT_NE(field, nullptr);
+    EXPECT_EQ(field->getMinimumHeight(), 90) << "the fixture did not make the field grow in context, so this "
+                                                 "asserts nothing about the case it exists for";
+
+    // The 2 is the popup's own bias, which TheFilterFieldIsPaidForOutOfTheCappedRoom documents.
+    EXPECT_LE(top + popupWindow->getSize().y, window->getHeight() + 2)
+        << "a filter field that measures larger once it is in a window pushed the popup out of the "
+           "window it belongs to";
+
+    window->removeAllViews();
+    AThread::processMessages();
+}
+
+// The placement, in the direction that does not need clamping, read where it is still readable --
+// see clickLeavingFrame for why that is before the next frame and not after it.
+//
+// This is the half of the factory the clamp does not touch, and it is pinned here so that the pair
+// is covered: a test that only asserts the clamped case says nothing about which branch ran.
+TEST_F(AComboboxTest, ThePopupOpensBelowTheComboBoxWhenThereIsRoomUnderIt) {
+    auto combo = _new<PopupWindowSpy>();
+    combo->setModel(AListModel<AString>::make({ "alpha", "beta", "gamma" }));
+    auto window = _new<TestWindow>();
+    window->setFixedSize({ 400, 300 });
+    window->setContents(Vertical { combo });
+    window->show();
+    uitest::frame();
+
+    const glm::ivec2 expected = combo->getPositionInWindow() + glm::ivec2(0, combo->getHeight());
+    clickLeavingFrame(combo);
+
+    auto popupWindow = combo->popupWindow();
+    ASSERT_NE(popupWindow, nullptr) << "the popup is not open";
+    EXPECT_EQ(popupWindow->getPosition(), expected) << "the popup did not open below the combo box";
+
+    uitest::frame();
+    window->removeAllViews();
+    AThread::processMessages();
+}
+
+// The placement in the direction that does, including the case where the clamp is the only thing
+// stopping the popup from being rejected outright.
+//
+// The unclamped second placement is `comboBoxPos - {0, popupHeight - 1}`, whose y is negative for
+// every combo box that gets as far as it -- being off the top is exactly what rejected the first
+// placement. An unclamped factory therefore rejects both, and createOverlappingSurface opens the
+// popup at its {0, 0} fallback. So a test that only watches the y, which the clamp always pulls to
+// 0, cannot tell the clamp from the fallback: both read (0, 0). The x is what tells them apart, and
+// that is why this fixture also puts the combo box hard against the right edge of its window.
+TEST_F(AComboboxTest, ThePopupClampsItselfIntoTheWindowWhenItHasToOpenAbove) {
+    auto combo = _new<PopupWindowSpy>();
+    combo->setModel(AListModel<AString>::make({ "alpha", "beta", "gamma" }));
+    auto window = _new<TestWindow>();
+    window->setFixedSize({ 400, 300 });
+    // top -40 puts it off the top edge, which is what forces the second placement; left 420 puts it
+    // past the right edge, so the second placement's x has to be clamped as well. Four numbers
+    // rather than a named constant: the point of the fixture is the geometry, and a reader should
+    // be able to see it without running anything.
+    combo AUI_OVERRIDE_STYLE {
+        ass::Margin { -40_px, 0_px, 0_px, 420_px },
+    };
+    window->setContents(Vertical { combo });
+    window->show();
+    uitest::frame();
+
+    const glm::ivec2 comboPos = combo->getPositionInWindow();
+    ASSERT_LT(comboPos.y + combo->getHeight(), 0) << "the fixture did not put the combo box off the top edge";
+    ASSERT_GT(comboPos.x, window->getSize().x) << "the fixture did not put it past the right edge";
+
+    clickLeavingFrame(combo);
+
+    auto popupWindow = combo->popupWindow();
+    ASSERT_NE(popupWindow, nullptr) << "the popup is not open";
+
+    const glm::ivec2 unclamped = comboPos - glm::ivec2(0, popupWindow->getSize().y - 1);
+    ASSERT_LT(unclamped.y, 0) << "the unclamped placement would not have been rejected, so the clamp is not what "
+                                "put the popup where it is";
+    ASSERT_NE(unclamped, glm::ivec2(0, 0)) << "the unclamped placement is indistinguishable from the fallback";
+
+    // Flush with the window's top edge, and pulled back to its right edge rather than sitting at
+    // the x it was handed -- which is the assertion that would fail with the clamp removed.
+    EXPECT_EQ(popupWindow->getPosition(), (glm::ivec2 { window->getSize().x, 0 }))
+        << "the popup was not clamped into the window it belongs to";
+
+    uitest::frame();
+    window->removeAllViews();
+    AThread::processMessages();
 }
 
 // ADropdownListCompat describes behaviour ADropdownList already has, so it is green against the old
