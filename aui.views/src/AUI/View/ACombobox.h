@@ -15,6 +15,7 @@
 #include <AUI/View/AComboboxRow.h>
 #include <AUI/View/AScrollArea.h>
 #include <AUI/View/ALabel.h>
+#include <AUI/View/ATextField.h>
 #include <AUI/Platform/AWindow.h>
 #include <AUI/Platform/AOverlappingSurface.h>
 #include <AUI/Model/IListModel.h>
@@ -135,6 +136,10 @@ public:
     /**
      * @brief Sets the predicate deciding which items the current query shows.
      * @param predicate nullptr restores pass-through, i.e. every item is shown.
+     * @details There is no default predicate, and cannot be one: turning an arbitrary T into
+     *          searchable text is the application's call, not the framework's. So an unset
+     *          predicate shows everything, which is what setFilter with no predicate installed
+     *          does -- the query is still stored and still announced, it simply excludes nothing.
      */
     void setFilterPredicate(Filter predicate) {
         mFilterPredicate = std::move(predicate);
@@ -148,6 +153,32 @@ public:
             rebuildRows();
         }
     }
+
+    /**
+     * @brief Shows, or hides, a text field at the top of the popup that filters the rows as it is
+     *        typed into.
+     * @details Opt-in, so a combo box nobody filters looks exactly as it did. The field is worth
+     *          nothing without a predicate: [setFilterPredicate] has no default because an
+     *          arbitrary T cannot be turned into searchable text, so the field on its own types a
+     *          query that hides nothing.
+     *          Turning the field off also clears the query, so the widget is never left hiding rows
+     *          behind a control the author has just taken away. That clear is an edit and is
+     *          announced like one; the clear that happens when a popup opens is not (see setFilter).
+     *          A popup that is already open survives the switch: the popup is a window of its own
+     *          and takes no instruction from the widget, so its field keeps the text it had. What it
+     *          loses is its vote -- the field's signals are ignored from here on, so typing into it
+     *          cannot put a query back into a filter that is off.
+     */
+    void setFilterEnabled(bool enabled) {
+        if (mFilterEnabled == enabled) {
+            return;
+        }
+        mFilterEnabled = enabled;
+        if (!enabled) {
+            setFilter({});
+        }
+    }
+    [[nodiscard]] bool isFilterEnabled() const noexcept { return mFilterEnabled; }
 
     auto filter() const {
         return APropertyDef { this, &ACombobox::getFilter, &ACombobox::setFilter, filterChanged };
@@ -376,6 +407,7 @@ private:
     _<AObject> mRowSink;                        // connection sink for the row handlers
     ViewFactory mViewFactory;
     Filter mFilterPredicate;
+    bool mFilterEnabled = false;
     AOptional<T> mSelected;
     AString mFilter;
 
@@ -514,34 +546,119 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
     if (!parentWindow) {
         return;
     }
+    if (mFilterEnabled && !mFilter.empty()) {
+        // A query left over from the last time the combo was used hides rows the author expects to
+        // see, and reads as a wrong list rather than a stale one. Clearing it must not fire
+        // filterChanged: opening a popup is not an author edit.
+        mFilter = {};
+        if (mFiltered) {
+            mFiltered->invalidate();
+        }
+        // No rebuildRows() here: the unconditional one a few lines further down does it, before the
+        // popup exists at all, so the one this block used to carry was a second rebuild of rows
+        // nothing had changed in between.
+    }
     auto comboBoxPos = getPositionInWindow();
 
     // The ceiling the popup may not pass, measured against the room its placement actually has.
     // createOverlappingSurface takes the first placement the factory offers that lands at
     // non-negative coordinates (ASurface.h:277) and "below" is offered first, so downwards is the
-    // side the popup opens towards for every combobox that is not itself above the window's origin;
-    // the room above is the bound for the one that is. Measuring the wrong side is the trap: against
-    // the room above, a combobox at the top of a window -- the ordinary case -- would be capped at the
-    // couple of pixels above it. Either way the bound is a slice of the parent's own height, and it is
-    // a bound on the scroll area rather than on the popup itself: the popup is `content` plus the
-    // surface's own chrome, and popupHeight adds the 2px bias underneath, so a popup pinned to the
-    // cap can still hang that much below the parent's bottom edge. Capping cannot push the rows off
-    // the screen either: below, the position does not depend on the height at all, and above, a
-    // shorter popup starts lower, i.e. nearer 0.
+    // side the popup opens towards for every combobox that is not itself off the top or left edge of
+    // its window; above is what the rest get. The two sides are not measured the same way, and the
+    // reason is that only one of them has a hard edge to measure to. Below, the combobox is above
+    // the popup and there is a definite amount of window left underneath it. Above, the position
+    // factory clamps the popup into the window, so the window is the only bound available before the
+    // height is known -- measuring instead the gap between the window's top and the combobox's own
+    // top degenerates to nothing for a combobox that hangs off the top edge, which is exactly the
+    // case that gets there, and would collapse the popup to zero height.
+    //
+    // The bound is a slice of the parent's own height, and it is a bound on the popup as a whole
+    // rather than on the scroll area alone: the popup is `content` plus the surface's own chrome, and
+    // popupHeight adds the 2px bias underneath, so a popup pinned to the cap can still hang that much
+    // below the parent's bottom edge. That is also why the cap is not merely handed over to
+    // createOverlappingSurface as a size: the popup is packed to its own minimum height, which is the
+    // content's, which is the rows' -- so a ceiling handed over as a size alone is undone by the next
+    // layout pass.
+    //
+    // Capping cannot push the rows off the screen either: below, the position does not depend on the
+    // height at all, and above, the factory clamps.
     const int openBelow = comboBoxPos.y + getHeight();
-    const int room = openBelow >= 0 ? parentWindow->getHeight() - openBelow : comboBoxPos.y + 1;
+    const bool opensBelow = openBelow >= 0 && comboBoxPos.x >= 0;
+    const int room = opensBelow ? parentWindow->getHeight() - openBelow : parentWindow->getHeight();
     const int popupMaxHeight = (glm::min)((glm::max)(room, 0), parentWindow->getHeight());
 
     rebuildRows();
+
+    // The filter field is built first, and that is not a matter of taste: its height comes out of
+    // the popup's ceiling below, and the ceiling goes into the scroll area's MaxSize, which is what
+    // the popup's own height is computed from. Anything the field is going to cost has to be known
+    // before that number is asked for.
+    _<ATextField> field;
+    int filterHeight = 0;
+    if (mFilterEnabled) {
+        field = _new<ATextField>();
+        // .input-field, which ATextField already carries, is most of what keeps the popup from
+        // looking assembled from two unrelated parts: the field arrives framed and white like the
+        // list below it, without this class duplicating either colour.
+        //
+        // It is not all of it, and the part it does not cover is worth naming before someone tries
+        // to close it. What separates the two is two stacked 1 dp grey rules, not one: the field's
+        // own border and .combobox_list's (AStylesheet.cpp:200 and :367), and they land adjacent --
+        // the field is content's first child and the list its second, with no spacing between them
+        // (AVerticalLayout's spacing is 0) -- so a two-tone horizontal line is drawn straight across
+        // the popup. The corner shapes are the other half: the field's are 4 dp, the list's are
+        // square. Both are left as they are on purpose; .combobox_filter is the hook for restyling
+        // the field, and nothing selects on it yet.
+        field << ".combobox_filter";
+        // No setText(mFilter): the clear above already ran, and it runs whenever mFilter is
+        // non-empty, so by this line the query is empty and the field starts empty with it. The
+        // connections below are made after this point anyway, so a setText here would reach nobody.
+        //
+        // Both announcements, and for the reason each one exists: setText announces on textChanged
+        // (AAbstractTextField.cpp:89) and a keystroke announces on textChanging (:175), so a field
+        // connected to only one of them answers only half the ways its own text can change --
+        // connected to textChanging alone it would show a setText's query without narrowing, and
+        // connected to textChanged alone the user could not type at all.
+        //
+        // Both check mFilterEnabled because the field outlives the setting in one case: the popup
+        // is a window of its own, so setFilterEnabled(false) while it is open leaves the field
+        // sitting there with the text it had. Without the guard, typing into it would put a query
+        // back into a filter the author had just switched off.
+        AObject::connect(field->textChanging, this, [this](const AString& text) {
+            if (mFilterEnabled) {
+                setFilter(text);
+            }
+        });
+        AObject::connect(field->textChanged, this, [this](const AString& text) {
+            if (mFilterEnabled) {
+                setFilter(text);
+            }
+        });
+        // Asked for here, off a field that is not in a window yet, so it is a number the layout can
+        // disagree with. A view with no ancestry is styled without the context-dependent rules that
+        // match on an ancestor -- a rule like `Window ATextField { MinSize { 100, 90 } }` cannot
+        // match it -- and adding the field to `content` puts the popup window above it, at which
+        // point the view-graph change invalidates the styles and the same field lays out larger.
+        // Measured, 400x300 window, 60 rows, that rule installed: 22 here, 90 once laid out.
+        //
+        // Which is why the ceiling below is also on `content` and not only on the list: the sum
+        // the popup's height is computed from is this number plus the list's, and a field that
+        // grows is room the popup does not have, so the popup leaves the parent by exactly its
+        // overshoot rather than the list merely falling short of the room.
+        filterHeight = field->getMinimumHeight();
+    }
+
     // AScrollArea has only a default constructor; content goes in via setContents.
     auto scrollArea = _new<AScrollArea>();
     scrollArea->setContents(mRowsContainer);
     scrollArea AUI_OVERRIDE_STYLE {
         ass::Margin { 0 },
-        // Not expanding vertically: that is what makes AScrollArea::getContentMinimumHeight report
-        // the rows' height instead of 0, so the popup -- which is packed to its minimum as soon as it
-        // is laid out -- is tall enough for the rows plus this container's own padding and border.
-        // Without it the popup is a couple of pixels short of its last row, scrollbar and all.
+        // Not expanding vertically: AScrollArea::getContentMinimumHeight answers 0 for a view that
+        // expands on that axis (AScrollArea.cpp:67), and the popup is packed to its own minimum as
+        // soon as it is laid out -- so an expanding list is a popup with no rows, and one that does
+        // not expand is a popup a couple of pixels short of its last row, scrollbar and all. That is
+        // also why the room above the list has to be taken off the ceiling by hand below, and why it
+        // cannot be taken off by letting the list expand into it.
         ass::Expanding { 1, 0 },
         // ... so the width still has to be stated outright; the height needs no statement.
         ass::MinSize { AMetric(getWidth(), AMetric::T_PX), {} },
@@ -551,20 +668,42 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
         // next layout pass. MaxSize is AScrollArea's documented way of becoming a scroll area without
         // expanding, and it is also what makes the viewport smaller than the content; with the two
         // the same size no scrollbar can appear however long the list is.
-        ass::MaxSize { {}, AMetric(popupMaxHeight, AMetric::T_PX) },
+        //
+        // What the list may have is what the room leaves once the filter field has taken its share.
+        // AView::getMinimumHeight clamps to MaxSize, so this is what the popup's own height is
+        // computed from a few lines further down -- had the ceiling stayed the full room, the field
+        // would have been added on top of a popup already sized to fill the window, and the bottom
+        // of the popup would hang past the parent's edge by the field's height.
+        ass::MaxSize { {}, AMetric((glm::max)(popupMaxHeight - filterHeight, 0), AMetric::T_PX) },
     };
     scrollArea << ".combobox_list";
 
     auto content = _new<AViewContainer>();
     content->setLayout(std::make_unique<AVerticalLayout>());
+    content AUI_OVERRIDE_STYLE {
+        // The same ceiling as the scroll area's, on the popup's content as a whole. The list's own
+        // MaxSize has the field's share subtracted from it, so the two sum to the room only while
+        // the field measures the same here as it measures once it is laid out -- and it need not
+        // (see where filterHeight is read). Uncapped, the popup's minimum is popupMaxHeight plus
+        // exactly the field's overshoot, so the popup leaves the parent by that much rather than
+        // the list falling short of the room.
+        //
+        // Clamping popupHeight instead would not do, for the reason the scroll area's MaxSize is
+        // there at all: the popup is packed to its own minimum every frame, so a bound that is not
+        // on something the minimum is read through is undone by the next layout pass.
+        ass::MaxSize { {}, AMetric(popupMaxHeight, AMetric::T_PX) },
+    };
+    if (field) {
+        content->addView(field);
+    }
     content->addView(scrollArea);
 
-    // Height must cover the whole popup content, so anything added above the list later (the filter
-    // field) has to go in before this is computed -- it lands in `content` and is counted here.
-    // Nothing is held back for it: the ceiling is the room there is, and whatever goes above the list
-    // spends it. Whoever adds a filter field decides whether it deserves a guaranteed share.
-    // The list's own ceiling is already folded into the minimum height read here, so this is the
-    // capped height when the rows do not fit and the content's own height when they do.
+    // Height must cover the whole popup content, so the filter field above has to be in before this
+    // is computed -- it lands in `content` and is counted here. The ceiling is the room there is and
+    // the field spends its share of it, so a list that no longer fits is the list that scrolls.
+    // The ceiling is already folded into the minimum height read here (getMinimumHeight clamps to
+    // MaxSize), on `content` as well as on the list inside it, so this is the capped height when
+    // the rows do not fit and the content's own height when they do.
     const int popupHeight = content->getMinimumHeight() + 2; // bias
     unsigned usedPositionIndex = 0;
 
@@ -573,7 +712,23 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
             usedPositionIndex = attempt;
             switch (attempt) {
                 case 0: return comboBoxPos + glm::ivec2(0, getHeight());
-                case 1: return comboBoxPos - glm::ivec2(0, popupHeight - 1);
+                // Clamped, because the raw subtraction is not a fallback at all: it is strictly
+                // above attempt 0's y for every popupHeight >= 2, so an unclamped attempt 1 could
+                // only ever be rejected where attempt 0 was, and the popup would never open at all
+                // for a combo box near the top of its window. Clamping makes it a real second
+                // choice -- flush with the window's top when there is room, slid down when there is
+                // not -- which is also what makes the room measured above the correct ceiling.
+                //
+                // Only the y is bounded, which is narrower than what the framework's other
+                // createOverlappingSurface overload clamps: that one subtracts the size on both
+                // axes (ASurface.h:253), so it also pulls the x in to keep the popup inside the
+                // window's right edge. Here the x is bounded by the window's width alone, so a
+                // popup wider than its window still hangs off the right. That is the looseness
+                // attempt 0 has always had, not something the clamp introduced, and
+                // ThePopupClampsItselfIntoTheWindowWhenItHasToOpenAbove pins it as it is -- the x
+                // at the window's width, not at the window's width less the popup's.
+                case 1: return glm::clamp(comboBoxPos - glm::ivec2(0, popupHeight - 1),
+                                          { 0, 0 }, parentWindow->getSize() - glm::ivec2(0, popupHeight));
                 default: return std::nullopt;
             }
         },
@@ -587,6 +742,11 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
     // ADropdownList's reveal, kept: opening downward grows the list out of nothing, opening upward
     // additionally slides it in from below. ASizeAnimator drives the real size and settles on it, so
     // the only price is that the rows are not hittable until the reveal is over.
+    //
+    // On the list and not on the popup, so with the filter field enabled the field is simply there
+    // while the rows grow in under it. That reads correctly rather than as a glitch: the field is the
+    // control the user is reaching for, and the rows are the answer to it arriving. Animating it too
+    // would only make the query impossible to type into during the reveal.
     if (usedPositionIndex == 0) {
         scrollArea->setAnimator(_new<ASizeAnimator>(glm::ivec2 { scrollArea->getWidth(), 0 }) AUI_LET {
             it->setDuration(0.15f);
