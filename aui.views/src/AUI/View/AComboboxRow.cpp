@@ -13,10 +13,10 @@
 
 #include <AUI/Layout/AVerticalLayout.h>
 
-AComboboxRow::AComboboxRow(const _<AView>& content) {
+AComboboxRow::AComboboxRow(_<AView> content) {
     addAssName(".list-item");
     setLayout(std::make_unique<AVerticalLayout>());
-    addView(content);
+    addView(std::move(content));
 }
 
 void AComboboxRow::setSelected(bool selected) {

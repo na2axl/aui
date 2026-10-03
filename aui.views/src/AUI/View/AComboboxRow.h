@@ -24,7 +24,7 @@
  */
 class API_AUI_VIEWS AComboboxRow : public AViewContainerBase, public ass::ISelectable {
 public:
-    explicit AComboboxRow(const _<AView>& content);
+    explicit AComboboxRow(_<AView> content);
 
     void setSelected(bool selected);
     [[nodiscard]] bool isSelected() const noexcept { return mSelected; }

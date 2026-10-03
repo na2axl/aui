@@ -13,6 +13,7 @@
 #include <AUI/Common/ATimer.h>
 #include <AUI/Util/UIBuildingHelpers.h>
 #include <AUI/View/ALabel.h>
+#include <AUI/View/AButton.h>
 #include <AUI/Platform/AWindow.h>
 #include <AUI/View/AViewContainer.h>
 #include <AUI/View/AComboboxRow.h>
@@ -160,6 +161,32 @@ protected:
     // There is no AView::performClick(); the uitest DSL is the repo's way to push a real click
     // through the window, which is also what exercises ACombobox::onPointerReleased.
     void clickCombo() { By::type<ACombobox<AString>>().perform(click()); }
+
+    // The label a combo box paints its selection into. updateText hands AButton::setText's
+    // `setContents(Centered { label })` a declarative::Centered, and setContents takes that
+    // container's children rather than the container itself, keeping its layout
+    // (AViewContainerBase.cpp:589) -- so the button's one child is the label, laid out by the
+    // AStackedLayout the Centered brought with it.
+    _<AView> buttonLabel(const _<AView>& button) {
+        auto container = _cast<AViewContainer>(button);
+        if (!container || container->getViews().size() != 1) {
+            return nullptr;
+        }
+        return container->getViews()[0];
+    }
+
+    // How far from its button's content edge a button's label sits, which is what separates a
+    // left-aligned label from a centred one. AStackedLayout decides it: a view that expands
+    // horizontally is placed at x = 0, one that does not at (width - finalWidth) / 2
+    // (AStackedLayout.cpp:18-27). Zero therefore means left-aligned, and nothing else.
+    int labelInset(const _<AView>& button) {
+        auto label = buttonLabel(button);
+        if (!label) {
+            ADD_FAILURE() << "the button does not hold exactly one label";
+            return -1;
+        }
+        return label->getPositionInWindow().x - button->getPositionInWindow().x - button->getPadding().left;
+    }
 
     // The popup reveals itself with an ASizeAnimator, growing its scroll area out of a zero height,
     // so a row is not hittable until the reveal is done. uitest::frame() does not advance the clock
@@ -316,15 +343,59 @@ TEST_F(AComboboxTest, SwappedOutModelStopsDrivingTheWidget) {
     auto newModel = AListModel<AString>::make({ "one", "two", "three" });
     combo->setModel(newModel);
 
-    const int afterSwap = combo->rebuilds;
+    // The popup has to be open, which is what this test was retargeted onto, not relaxed onto. A
+    // closed combo box rebuilds nothing on a mutation any more -- there is no popup to be stale and
+    // its rows are rebuilt on the way to opening -- so counting rebuilds with the popup shut counts
+    // zero and proves nothing. Opened, the count is a live subscription again: a leaked binding to
+    // oldModel moves it, an intact one does not.
+    mWindow->addView(combo);
+    uitest::frame();
+    By::value(combo).perform(click());
+    uitest::frame();
+    ASSERT_TRUE(combo->isPopupOpen()) << "the popup did not open, so nothing below observes anything";
+
+    const int afterOpen = combo->rebuilds;
+    ASSERT_GT(afterOpen, 0) << "opening the popup rebuilt nothing, so this counter is not wired up";
 
     // push_back announces on dataInserted, so a still-bound combobox would react to this.
     oldModel->push_back("MUTATED");
-    EXPECT_EQ(combo->rebuilds, afterSwap) << "the swapped-out model is still driving the widget";
+    EXPECT_EQ(combo->rebuilds, afterOpen) << "the swapped-out model is still driving the widget";
 
     // ...and the model actually in use does reach it.
     newModel->push_back("four");
-    EXPECT_GT(combo->rebuilds, afterSwap) << "the current model is not driving the widget";
+    EXPECT_GT(combo->rebuilds, afterOpen) << "the current model is not driving the widget";
+}
+
+// The other half of the same seam, and the one that has observable cost. A closed combo box is
+// rebuilt on the way to opening anyway (onPointerReleased), so a model mutation while it is shut
+// has nothing to refresh: rebuilding here would allocate an AComboboxRow and a content view per
+// item, for a popup nobody can see, and on a 5k-item model that is 5k allocations per mutation to
+// arrive at exactly the state the next click produces anyway.
+//
+// The assertion is on the closed case alone. The open case is what makes it discriminating, and it
+// is the same measurement SwappedOutModelStopsDrivingTheWidget makes: a rebuild that does not happen
+// with no popup open, and does happen with one, is the guard rather than a dead counter.
+TEST_F(AComboboxTest, ModelMutationRebuildsRowsOnlyWhileThePopupIsOpen) {
+    auto combo = _new<CountingCombobox>();
+    auto model = AListModel<AString>::make({ "alpha", "beta", "gamma" });
+    combo->setModel(model);
+    mWindow->addView(combo);
+    uitest::frame();
+
+    const int beforeMutation = combo->rebuilds;
+    model->push_back("delta");
+    EXPECT_EQ(combo->rebuilds, beforeMutation)
+        << "a closed combo box rebuilt its rows for a popup that does not exist";
+    // The button still answers a mutation: it is the rows that are not rebuilt, not the widget.
+    ASSERT_TRUE(combo->getSelected().hasValue()) << "the mutation dropped the selection it should not have";
+
+    By::value(combo).perform(click());
+    uitest::frame();
+    ASSERT_TRUE(combo->isPopupOpen()) << "the popup did not open, so nothing below observes anything";
+
+    const int afterOpen = combo->rebuilds;
+    model->push_back("epsilon");
+    EXPECT_GT(combo->rebuilds, afterOpen) << "an open popup's rows are not rebuilt on a mutation any more";
 }
 
 TEST_F(AComboboxTest, PopupOpensAndCloses) {
@@ -648,6 +719,53 @@ TEST_F(AComboboxTest, GenericItemTypeRoundTripsByValue) {
     mPersonCombo->setSelectionId(1);
     ASSERT_TRUE(mPersonCombo->getSelected().hasValue());
     EXPECT_EQ(mPersonCombo->getSelected().value().id, 2);
+}
+
+// The button's label, for an item type that is not AString.
+//
+// The stylesheet rule that makes a combo box's button label left-aligning was keyed on
+// t<ADropdownList>(), which is ACombobox<AString> and nothing else, so ACombobox<Person> -- the
+// case this widget exists for -- matched nothing at all. Its label was neither expanding nor
+// left-aligned, and since updateText paints it into a declarative::Centered, it came out centred
+// while the dropdown it replaced rendered left-aligned. Nothing asserts, nothing fails: the widget
+// simply looks subtly wrong, and only for the item types nobody had written yet.
+//
+// The rule is keyed on the .combobox class every ACombobox carries, which survives the next
+// ACombobox<Foo>. Keying it on the alias would have kept this exactly one instantiation wide.
+TEST_F(AComboboxTest, ButtonLabelIsLeftAlignedForANonStringItemType) {
+    class W : public AWindow {
+    public:
+        _<ACombobox<Person>> personCombo;
+        _<AButton> plainButton;
+
+        W() : AWindow("label-alignment", 400_dp, 300_dp) {
+            setFixedSize({ 400, 300 });
+            personCombo = _new<ACombobox<Person>>();
+            // The control: laid out by the same declarative::Centered, matching no combobox rule,
+            // and therefore placed exactly where a non-AString combo box's label used to land.
+            plainButton = _new<AButton>(AString { "alpha" });
+            setContents(Vertical { personCombo, plainButton });
+            // Order matters for a non-AString T: setModel renders the default selection straight
+            // away, so the factory has to be in place first or viewFor trips its assertion.
+            personCombo->setViewFactory([](const Person& p) { return _new<ALabel>(p.name); });
+            personCombo->setModel(AListModel<Person>::make({ Person { 1, "alpha" } }));
+        }
+    };
+
+    auto window = _new<W>();
+    window->show();
+    uitest::frame();
+
+    // ...first, that the measurement can tell a centred label from a left-aligned one at all. An
+    // inset of zero is only evidence if zero is not what every label here reads.
+    ASSERT_GT(labelInset(window->plainButton), 0)
+        << "the control label is not centred, so this fixture cannot tell the two apart";
+
+    EXPECT_EQ(labelInset(window->personCombo), 0)
+        << "a combo box whose item type is not AString renders its button label centred";
+
+    window->removeAllViews();
+    AThread::processMessages();
 }
 
 // The filter field. Everything below is opt-in: with setFilterEnabled left alone the popup holds the
