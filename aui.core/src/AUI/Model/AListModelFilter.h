@@ -16,39 +16,26 @@
 #include <AUI/Common/AVector.h>
 #include <functional>
 
-template<typename T, typename Filter>
-class AListModelFilter: public IListModel<T> {
-private:
+template <typename T>
+class AListModelFilter : public IListModel<T> {
+public:
     /**
      * @brief Type-erased predicate.
      * @details
-     * Every lambda-expression has its own closure type, so the predicate cannot be stored as `Filter` if it is to be
-     * replaceable afterwards. See [setFilter].
+     * Every lambda-expression has its own closure type. See [setFilter].
      */
-    using filter_t = std::function<bool(const T&)>;
+    using filter_type = std::function<bool(const T&)>;
 
-    _<IListModel<T>> mOther;
-    filter_t mFilter;
-    AVector<size_t> mMapping;
-
-    void fill() {
-        for (size_t i = 0; i < mOther->listSize(); ++i) {
-            if (mFilter(mOther->listItemAt(i))) {
-                mMapping.push_back(i);
-            }
-        }
-    }
-public:
     using value_type = T;
 
-    explicit AListModelFilter(const _<IListModel<T>>& other, Filter&& adapter) :
-            mOther(other),
-            mFilter(std::forward<Filter>(adapter)) {
+    explicit AListModelFilter(const _<IListModel<T>>& other, filter_type&& adapter) :
+        mOther(other),
+        mFilter(std::forward<filter_type>(adapter)) {
         fill();
 
-        AObject::connect(other->dataChanged, this, [&](const AListModelRange<T>&){ invalidate(); });
-        AObject::connect(other->dataInserted, this, [&](const AListModelRange<T>&){ invalidate(); });
-        AObject::connect(other->dataRemoved, this, [&](const AListModelRange<T>&){ invalidate(); });
+        AObject::connect(other->dataChanged, this, [&](const AListModelRange<T>&) { invalidate(); });
+        AObject::connect(other->dataInserted, this, [&](const AListModelRange<T>&) { invalidate(); });
+        AObject::connect(other->dataRemoved, this, [&](const AListModelRange<T>&) { invalidate(); });
     }
 
 
@@ -86,7 +73,7 @@ public:
      * @brief Replaces the predicate and re-applies it.
      * @param filter new predicate; the filter runs immediately, so this may notify observers.
      */
-    void setFilter(filter_t filter) {
+    void setFilter(filter_type filter) {
         mFilter = std::move(filter);
         invalidate();
     }
@@ -103,16 +90,31 @@ public:
         });
         int offset = 0;
         for (const AListModelRange<T>& r : ranges) {
-            mMapping.erase(mMapping.begin() + r.getBegin().getRow() - offset, mMapping.begin() + r.getEnd().getRow()) - offset;
+            mMapping.erase(mMapping.begin() + r.getBegin().getRow() - offset,
+                           mMapping.begin() + r.getEnd().getRow()) - offset;
             offset += r.getEnd().getRow() - r.getBegin().getRow();
+        }
+    }
+
+private:
+    _<IListModel<T>> mOther;
+    filter_type mFilter;
+    AVector<size_t> mMapping;
+
+    void fill() {
+        for (size_t i = 0; i < mOther->listSize(); ++i) {
+            if (mFilter(mOther->listItemAt(i))) {
+                mMapping.push_back(i);
+            }
         }
     }
 };
 
 namespace AModels {
-    template <typename Container, typename Filter>
-    auto filter(const _<Container>& other, Filter&& filter) -> _<AListModelFilter<typename Container::value_type, Filter>> {
-        return aui::ptr::manage_shared(new AListModelFilter<typename Container::value_type, Filter>(other, std::forward<Filter>(filter)));
-    }
+template <typename Container>
+auto filter(const _<Container>& other, typename AListModelFilter<typename Container::value_type>::filter_type&& filter)
+    -> _<AListModelFilter<typename Container::value_type>> {
+    return aui::ptr::manage_shared(new AListModelFilter<typename Container::value_type>(
+        other, std::forward<typename AListModelFilter<typename Container::value_type>::filter_type>(filter)));
 }
-
+}
