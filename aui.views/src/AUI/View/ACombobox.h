@@ -100,7 +100,7 @@ public:
         mModelSink = nullptr;
         mModel = model;
 
-        mFiltered = _new<AListModelFilter<T, RowFilter>>(mModel, [this](const T& item) {
+        mFiltered = _new<AListModelFilter<T>>(mModel, [this](const T& item) {
             return !mFilterPredicate || mFilterPredicate(item, mFilter);
         });
 
@@ -421,7 +421,7 @@ private:
     }
 
     _<IListModel<T>> mModel;
-    _<AListModelFilter<T, RowFilter>> mFiltered;
+    _<AListModelFilter<T>> mFiltered;
     _<AObject> mModelSink;                      // connection sink; replaced to unbind the old model
     _<AObject> mRowSink;                        // connection sink for the row handlers
     ViewFactory mViewFactory;
@@ -714,16 +714,10 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
         ass::MaxSize { {}, AMetric(popupMaxHeight, AMetric::T_PX) },
     };
     if (field) {
-        // `field` is the predicate here and mFilterEnabled is what it tracks: the handle is created
-        // under exactly that test at the top of this function and is never reassigned, so a popup
-        // has one exactly when the filter is on. Naming .combobox_popup there and not here would
-        // restyle every ADropdownList in every application -- it is what makes .combobox_list give
-        // up its own frame in exchange, and a popup with no field has nothing to share it with, so
-        // it keeps the frame it has always had. See AStylesheet.cpp.
-        content << ".combobox_popup";
         content->addView(field);
     }
     content->addView(scrollArea);
+    content << ".combobox_popup";
 
     // Height must cover the whole popup content, so the filter field above has to be in before this
     // is computed -- it lands in `content` and is counted here. The ceiling is the room there is and
