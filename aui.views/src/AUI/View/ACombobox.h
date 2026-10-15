@@ -295,7 +295,8 @@ public:
     void destroyWindow();
 
     void render(ARenderContext context) override;
-    [[nodiscard]] int getContentMinimumWidth() override;
+    glm::ivec2 onIntrinsicMeasure(AConstraints constraints) override;
+    AMinMaxAxis onComputeIntrinsicMinMaxAxis(int height) override;
     void onPointerPressed(const APointerPressedEvent& event) override;
     void onPointerReleased(const APointerReleasedEvent& event) override;
     void onPointerMove(glm::vec2 pos, const APointerMoveEvent& event) override;
@@ -508,8 +509,16 @@ void ACombobox<T>::render(ARenderContext context) {
 }
 
 template <typename T>
-int ACombobox<T>::getContentMinimumWidth() {
-    return AButton::getContentMinimumWidth() + 20;
+glm::ivec2 ACombobox<T>::onIntrinsicMeasure(AConstraints constraints) {
+    return AButton::onIntrinsicMeasure(constraints) + glm::ivec2(20, 0);
+}
+
+template <typename T>
+AMinMaxAxis ACombobox<T>::onComputeIntrinsicMinMaxAxis(int height) {
+    auto minMax = AButton::onComputeIntrinsicMinMaxAxis(height);
+    minMax.min += 20;
+    minMax.max += 20;
+    return minMax;
 }
 
 template <typename T>
@@ -665,7 +674,7 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
         // the popup's height is computed from is this number plus the list's, and a field that
         // grows is room the popup does not have, so the popup leaves the parent by exactly its
         // overshoot rather than the list merely falling short of the room.
-        filterHeight = field->getMinimumHeight();
+        filterHeight = field->getHeight();
     }
 
     // AScrollArea has only a default constructor; content goes in via setContents.
@@ -725,7 +734,7 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
     // The ceiling is already folded into the minimum height read here (getMinimumHeight clamps to
     // MaxSize), on `content` as well as on the list inside it, so this is the capped height when
     // the rows do not fit and the content's own height when they do.
-    const int popupHeight = content->getMinimumHeight() + 2; // bias
+    const int popupHeight = content->getHeight() + 2; // bias
     unsigned usedPositionIndex = 0;
 
     auto comboWindow = parentWindow->createOverlappingSurface(
@@ -753,7 +762,7 @@ void ACombobox<T>::onPointerReleased(const APointerReleasedEvent& event) {
                 default: return std::nullopt;
             }
         },
-        { (glm::max)(getWidth(), content->getMinimumWidth()), popupHeight });
+        { (glm::max)(getWidth(), content->getWidth()), popupHeight });
 
     comboWindow->setLayout(std::make_unique<AVerticalLayout>());
     comboWindow->addView(content);
