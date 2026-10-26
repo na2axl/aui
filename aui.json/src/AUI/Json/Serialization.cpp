@@ -113,13 +113,26 @@ static AJson read(ATokenizer& t) {
                 }
                 if (c == '.') {
                     // double
-                    auto currentColumn = t.getColumn();
-                    auto remainder = t.readLongInt();
-                    auto digitCount = t.getColumn() - currentColumn;
+                    // count the digits actually read: the tokenizer column can't be used for that as it resets on '\n'.
+                    int64_t remainder = 0;
+                    int digitCount = 0;
+                    try {
+                        for (;;) {
+                            auto digit = t.readChar();
+                            if (!isdigit(uint8_t(digit))) {
+                                t.reverseByte();
+                                break;
+                            }
+                            remainder = remainder * 10 + (digit - '0');
+                            ++digitCount;
+                        }
+                    } catch (const AEOFException&) {
+                        // the number ends the document
+                    }
                     auto integer = static_cast<double>(longInt);
                     double s = isMinus ? -1.0 : 1.0;
 
-                    double value = integer + static_cast<double>(remainder) / std::pow(10.0, digitCount - 1) * s;
+                    double value = integer + static_cast<double>(remainder) / std::pow(10.0, digitCount) * s;
                     if (t.getLastCharacter() == 'e' || t.getLastCharacter() == 'E') {
                         t.readChar();
                         auto exponent = t.readLongInt();
